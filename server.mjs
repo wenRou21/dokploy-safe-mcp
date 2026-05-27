@@ -80,7 +80,7 @@ server.tool(
 		limit: z.number().int().positive().optional().describe("Maximum applications and compose rows to return. Default 100."),
 	},
 	async (input) => {
-		const limit = input.limit || 100;
+		const limit = clampSearchLimit(input.limit);
 		const [projects, applications, compose] = await Promise.all([
 			dokploy("GET", "/project.all"),
 			dokploy("GET", "/application.search", { limit, offset: 0 }),
@@ -148,7 +148,7 @@ server.tool(
 	"dokploy_application_search",
 	"Search/list Dokploy applications visible to the configured API key.",
 	{
-		limit: z.number().int().positive().optional(),
+		limit: z.number().int().positive().max(100).optional(),
 		offset: z.number().int().nonnegative().optional(),
 		name: z.string().optional(),
 		q: z.string().optional(),
@@ -156,7 +156,7 @@ server.tool(
 		environmentId: z.string().optional(),
 	},
 	async (input) => jsonToolResult(await dokploy("GET", "/application.search", {
-		limit: input.limit || 100,
+		limit: clampSearchLimit(input.limit),
 		offset: input.offset || 0,
 		name: input.name,
 		q: input.q,
@@ -201,7 +201,7 @@ server.tool(
 	"dokploy_compose_search",
 	"Search/list Dokploy compose services visible to the configured API key.",
 	{
-		limit: z.number().int().positive().optional(),
+		limit: z.number().int().positive().max(100).optional(),
 		offset: z.number().int().nonnegative().optional(),
 		name: z.string().optional(),
 		q: z.string().optional(),
@@ -210,7 +210,7 @@ server.tool(
 		appName: z.string().optional(),
 	},
 	async (input) => jsonToolResult(await dokploy("GET", "/compose.search", {
-		limit: input.limit || 100,
+		limit: clampSearchLimit(input.limit),
 		offset: input.offset || 0,
 		name: input.name,
 		q: input.q,
@@ -803,6 +803,14 @@ function normalizeApiPath(path) {
 	const trimmed = path.trim();
 	const withoutApi = trimmed.replace(/^\/?api\//, "");
 	return `/${withoutApi.replace(/^\/+/, "")}`;
+}
+
+function clampSearchLimit(limit) {
+	if (limit === undefined || limit === null) {
+		return 100;
+	}
+
+	return Math.min(Math.max(Number(limit), 1), 100);
 }
 
 function sanitizeName(name) {
