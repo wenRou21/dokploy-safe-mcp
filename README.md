@@ -4,10 +4,13 @@ Safe Dokploy deployment wrapper MCP for this server.
 
 It provides:
 
+- `dokploy_platform_rules`
 - `dokploy_deploy_static_page`
 - `dokploy_publish_route`
 
 The tools always use the public entry `http://183.196.108.32:18080`, publish routes through `/join/routes`, and verify the final public URL returns 200.
+
+This MCP also exposes server instructions telling Codex to prefer `dokploy_safe` for Dokploy deployment and route publishing. The raw `dokploy` MCP is still useful for listing projects, inspecting logs, checking status, and advanced operations not wrapped here.
 
 ## Recommended npx config from GitHub
 
@@ -27,6 +30,23 @@ DOKPLOY_API_KEY = "<YOUR_DOKPLOY_API_KEY>"
 ```
 
 Then restart Codex completely.
+
+## Recommended npx config from npm
+
+After the package is published to npm, this is the simplest config:
+
+```toml
+[mcp_servers.dokploy_safe]
+command = "npx"
+args = ["-y", "dokploy-safe-mcp"]
+enabled = true
+startup_timeout_sec = 120
+
+[mcp_servers.dokploy_safe.env]
+DOKPLOY_URL = "http://183.196.108.32:18080"
+DOKPLOY_PUBLIC_HTTP_URL = "http://183.196.108.32:18080"
+DOKPLOY_API_KEY = "<YOUR_DOKPLOY_API_KEY>"
+```
 
 Codex prompt template:
 

@@ -22,11 +22,47 @@ const RESERVED_PATHS = new Set([
 const server = new McpServer({
 	name: "dokploy-safe-mcp",
 	version: "1.0.0",
+}, {
+	instructions: [
+		"This server is the preferred entry point for Dokploy deployment and route publishing on this host.",
+		"Before deploying to Dokploy or publishing a public path, use dokploy_safe tools first.",
+		"Use the raw dokploy MCP only for low-level inspection, logs, troubleshooting, or operations not covered here.",
+		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
+		"Member API keys normally cannot write Traefik files directly. Use /join/routes through dokploy_publish_route or dokploy_deploy_static_page.",
+		"New public deployments must use a unique path prefix and verify the final public URL returns 200.",
+	].join(" "),
 });
+
+server.tool(
+	"dokploy_platform_rules",
+	[
+		"Return the required deployment rules for this Dokploy host.",
+		"Call this before using raw dokploy MCP tools for deployment-related work.",
+		"For deployment and route publishing, prefer dokploy_deploy_static_page or dokploy_publish_route.",
+	].join(" "),
+	{},
+	async () => jsonToolResult({
+		ok: true,
+		message: "Use dokploy_safe as the preferred entry point for deployment and route publishing.",
+		preferredTools: [
+			"dokploy_deploy_static_page",
+			"dokploy_publish_route",
+		],
+		rawDokployUseCases: [
+			"List projects/applications/compose",
+			"Inspect logs and status",
+			"Troubleshoot resources",
+			"Perform advanced operations not covered by dokploy_safe",
+		],
+		rules: platformRules(),
+	}),
+);
 
 server.tool(
 	"dokploy_publish_route",
 	[
+		"Preferred tool for publishing any Dokploy public route on this host.",
+		"Use this before or instead of raw dokploy MCP when a compose/application needs a public path.",
 		"Publish a safe path route for an existing Dokploy compose or application.",
 		"This tool never writes Traefik directly. It calls /join/routes, which validates the user's API key,",
 		"creates Host(183.196.108.32) && PathPrefix(/xxx), defaults stripPrefix, reloads Traefik server-side,",
@@ -57,6 +93,8 @@ server.tool(
 server.tool(
 	"dokploy_deploy_static_page",
 	[
+		"Preferred tool for deploying a simple static page to this Dokploy host.",
+		"Use this before or instead of raw dokploy MCP for static-page deployments.",
 		"Deploy a simple static page to Dokploy using nginx:alpine, then publish and verify a safe path route.",
 		"It creates a project, production environment, raw docker-compose compose, forces compose.update with sourceType=raw,",
 		"deploys the compose, publishes through /join/routes, and verifies http://183.196.108.32:18080/<path>/ returns 200.",
