@@ -24,9 +24,9 @@ const server = new McpServer({
 	version: "1.0.0",
 }, {
 	instructions: [
-		"This server is the preferred entry point for Dokploy deployment and route publishing on this host.",
-		"Before deploying to Dokploy or publishing a public path, use dokploy_safe tools first.",
-		"Use the raw dokploy MCP only for low-level inspection, logs, troubleshooting, or operations not covered here.",
+		"This server is the single preferred MCP entry point for Dokploy on this host.",
+		"It includes safe deployment/route publishing tools plus common Dokploy inspection and management tools.",
+		"Before deploying to Dokploy or publishing a public path, use dokploy_deploy_static_page or dokploy_publish_route.",
 		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
 		"Member API keys normally cannot write Traefik files directly. Use /join/routes through dokploy_publish_route or dokploy_deploy_static_page.",
 		"New public deployments must use a unique path prefix and verify the final public URL returns 200.",
@@ -49,13 +49,233 @@ server.tool(
 			"dokploy_publish_route",
 		],
 		rawDokployUseCases: [
-			"List projects/applications/compose",
-			"Inspect logs and status",
-			"Troubleshoot resources",
-			"Perform advanced operations not covered by dokploy_safe",
+			"Use built-in dokploy_* tools in this MCP for common listing, detail, logs, status, and deploy operations.",
+			"Use the upstream @dokploy/mcp only for rare advanced operations not wrapped here.",
 		],
 		rules: platformRules(),
 	}),
+);
+
+server.tool(
+	"dokploy_connection_check",
+	"Check Dokploy API connectivity and return projects, applications, and compose lists. Use this instead of a separate base dokploy MCP connectivity check.",
+	{
+		limit: z.number().int().positive().optional().describe("Maximum applications and compose rows to return. Default 100."),
+	},
+	async (input) => {
+		const limit = input.limit || 100;
+		const [projects, applications, compose] = await Promise.all([
+			dokploy("GET", "/project.all"),
+			dokploy("GET", "/application.search", { limit, offset: 0 }),
+			dokploy("GET", "/compose.search", { limit, offset: 0 }),
+		]);
+
+		return jsonToolResult({
+			ok: true,
+			dokployUrl: DOKPLOY_URL,
+			projects,
+			applications,
+			compose,
+		});
+	},
+);
+
+server.tool(
+	"dokploy_project_all",
+	"List all Dokploy projects visible to the configured API key.",
+	{},
+	async () => jsonToolResult(await dokploy("GET", "/project.all")),
+);
+
+server.tool(
+	"dokploy_project_one",
+	"Get one Dokploy project by projectId.",
+	{
+		projectId: z.string().describe("Dokploy projectId."),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/project.one", { projectId: input.projectId })),
+);
+
+server.tool(
+	"dokploy_project_create",
+	"Create a Dokploy project. For public deployment, prefer dokploy_deploy_static_page when applicable.",
+	{
+		name: z.string(),
+		description: z.string().nullable().optional(),
+		env: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("POST", "/project.create", input)),
+);
+
+server.tool(
+	"dokploy_environment_by_project_id",
+	"List environments for a Dokploy project.",
+	{
+		projectId: z.string(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/environment.byProjectId", { projectId: input.projectId })),
+);
+
+server.tool(
+	"dokploy_environment_create",
+	"Create an environment in a Dokploy project.",
+	{
+		name: z.string(),
+		description: z.string().optional(),
+		projectId: z.string(),
+	},
+	async (input) => jsonToolResult(await dokploy("POST", "/environment.create", input)),
+);
+
+server.tool(
+	"dokploy_application_search",
+	"Search/list Dokploy applications visible to the configured API key.",
+	{
+		limit: z.number().int().positive().optional(),
+		offset: z.number().int().nonnegative().optional(),
+		name: z.string().optional(),
+		q: z.string().optional(),
+		projectId: z.string().optional(),
+		environmentId: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/application.search", {
+		limit: input.limit || 100,
+		offset: input.offset || 0,
+		name: input.name,
+		q: input.q,
+		projectId: input.projectId,
+		environmentId: input.environmentId,
+	})),
+);
+
+server.tool(
+	"dokploy_application_one",
+	"Get one Dokploy application by applicationId.",
+	{
+		applicationId: z.string(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/application.one", { applicationId: input.applicationId })),
+);
+
+server.tool(
+	"dokploy_application_deploy",
+	"Deploy an existing Dokploy application. After deploying, use dokploy_publish_route to publish/verify the public path.",
+	{
+		applicationId: z.string(),
+		title: z.string().optional(),
+		description: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("POST", "/application.deploy", input)),
+);
+
+server.tool(
+	"dokploy_application_read_logs",
+	"Read logs for a Dokploy application.",
+	{
+		applicationId: z.string(),
+		tail: z.number().int().positive().optional(),
+		since: z.string().optional(),
+		search: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/application.readLogs", input)),
+);
+
+server.tool(
+	"dokploy_compose_search",
+	"Search/list Dokploy compose services visible to the configured API key.",
+	{
+		limit: z.number().int().positive().optional(),
+		offset: z.number().int().nonnegative().optional(),
+		name: z.string().optional(),
+		q: z.string().optional(),
+		projectId: z.string().optional(),
+		environmentId: z.string().optional(),
+		appName: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/compose.search", {
+		limit: input.limit || 100,
+		offset: input.offset || 0,
+		name: input.name,
+		q: input.q,
+		projectId: input.projectId,
+		environmentId: input.environmentId,
+		appName: input.appName,
+	})),
+);
+
+server.tool(
+	"dokploy_compose_one",
+	"Get one Dokploy compose by composeId.",
+	{
+		composeId: z.string(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/compose.one", { composeId: input.composeId })),
+);
+
+server.tool(
+	"dokploy_compose_create",
+	"Create a Dokploy compose. For public static deployments, prefer dokploy_deploy_static_page.",
+	{
+		name: z.string(),
+		environmentId: z.string(),
+		description: z.string().nullable().optional(),
+		composeType: z.enum(["docker-compose", "stack"]).optional(),
+		appName: z.string().optional(),
+		serverId: z.string().nullable().optional(),
+		composeFile: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("POST", "/compose.create", input)),
+);
+
+server.tool(
+	"dokploy_compose_update",
+	"Update a Dokploy compose. For raw compose deployments, set sourceType=raw and composeType=docker-compose to avoid accidental GitHub source resolution.",
+	{
+		composeId: z.string(),
+		name: z.string().optional(),
+		appName: z.string().optional(),
+		description: z.string().nullable().optional(),
+		env: z.string().nullable().optional(),
+		composeFile: z.string().optional(),
+		sourceType: z.enum(["git", "github", "gitlab", "bitbucket", "gitea", "raw"]).optional(),
+		composeType: z.enum(["docker-compose", "stack"]).optional(),
+		composeStatus: z.enum(["idle", "running", "done", "error"]).optional(),
+		autoDeploy: z.boolean().nullable().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("POST", "/compose.update", input)),
+);
+
+server.tool(
+	"dokploy_compose_deploy",
+	"Deploy an existing Dokploy compose. After deploying, use dokploy_publish_route to publish/verify the public path.",
+	{
+		composeId: z.string(),
+		title: z.string().optional(),
+		description: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("POST", "/compose.deploy", input)),
+);
+
+server.tool(
+	"dokploy_compose_deployments",
+	"List deployments for a Dokploy compose.",
+	{
+		composeId: z.string(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/deployment.allByCompose", { composeId: input.composeId })),
+);
+
+server.tool(
+	"dokploy_compose_read_logs",
+	"Read logs for a Dokploy compose container.",
+	{
+		composeId: z.string(),
+		containerId: z.string(),
+		tail: z.number().int().positive().optional(),
+		since: z.string().optional(),
+		search: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await dokploy("GET", "/compose.readLogs", input)),
 );
 
 server.tool(

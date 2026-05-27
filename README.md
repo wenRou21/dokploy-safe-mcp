@@ -1,27 +1,35 @@
 # dokploy-safe-mcp
 
-Safe Dokploy deployment wrapper MCP for this server.
+Single MCP entry point for this Dokploy host.
 
-It provides:
+It includes safe deployment tools plus common Dokploy inspection and management tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
+
+Core safe tools:
 
 - `dokploy_platform_rules`
+- `dokploy_connection_check`
 - `dokploy_deploy_static_page`
 - `dokploy_publish_route`
 
-The tools always use the public entry `http://183.196.108.32:18080`, publish routes through `/join/routes`, and verify the final public URL returns 200.
+Common Dokploy tools included:
 
-This MCP also exposes server instructions telling Codex to prefer `dokploy_safe` for Dokploy deployment and route publishing. The raw `dokploy` MCP is still useful for listing projects, inspecting logs, checking status, and advanced operations not wrapped here.
+- project list/detail/create
+- environment list/create
+- application search/detail/deploy/logs
+- compose search/detail/create/update/deploy/deployments/logs
 
-## Recommended npx config from GitHub
+The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish routes through `/join/routes`, and verify the final public URL returns 200.
 
-After this folder is pushed to GitHub, users do not need to download the folder manually. They can add this to Codex config and replace the GitHub repo plus API key:
+## Recommended Codex Config
+
+Users do not need to download this folder manually. Add this single MCP server to Codex config and replace the API key:
 
 ```toml
 [mcp_servers.dokploy_safe]
 command = "npx"
-args = ["-y", "github:<GITHUB_USER_OR_ORG>/dokploy-safe-mcp"]
+args = ["-y", "github:wenRou21/dokploy-safe-mcp"]
 enabled = true
-startup_timeout_sec = 120
+startup_timeout_sec = 180
 
 [mcp_servers.dokploy_safe.env]
 DOKPLOY_URL = "http://183.196.108.32:18080"
@@ -31,40 +39,32 @@ DOKPLOY_API_KEY = "<YOUR_DOKPLOY_API_KEY>"
 
 Then restart Codex completely.
 
-## Recommended npx config from npm
-
-After the package is published to npm, this is the simplest config:
-
-```toml
-[mcp_servers.dokploy_safe]
-command = "npx"
-args = ["-y", "dokploy-safe-mcp"]
-enabled = true
-startup_timeout_sec = 120
-
-[mcp_servers.dokploy_safe.env]
-DOKPLOY_URL = "http://183.196.108.32:18080"
-DOKPLOY_PUBLIC_HTTP_URL = "http://183.196.108.32:18080"
-DOKPLOY_API_KEY = "<YOUR_DOKPLOY_API_KEY>"
-```
-
-Codex prompt template:
+## Prompt Template
 
 ```text
-请帮我配置 Dokploy safe MCP。
+Please configure Dokploy safe MCP for Codex.
 
-MCP 包地址：
-github:<GITHUB_USER_OR_ORG>/dokploy-safe-mcp
+MCP package:
+github:wenRou21/dokploy-safe-mcp
 
-我的 Dokploy API Key：
+My Dokploy API Key:
 <YOUR_DOKPLOY_API_KEY>
 
-请把它加入 Codex MCP 配置，DOKPLOY_URL 和 DOKPLOY_PUBLIC_HTTP_URL 都用 http://183.196.108.32:18080。配置完成后提醒我彻底重启 Codex。
+Add this MCP to Codex config:
+- MCP name: dokploy_safe
+- command: npx
+- args: ["-y", "github:wenRou21/dokploy-safe-mcp"]
+- startup_timeout_sec: 180
+- DOKPLOY_URL: http://183.196.108.32:18080
+- DOKPLOY_PUBLIC_HTTP_URL: http://183.196.108.32:18080
+- DOKPLOY_API_KEY: use the key above
+
+After configuration, remind me to fully restart Codex. After restart, check Dokploy connectivity and list projects, applications, compose, and dokploy_safe tools.
 ```
 
-## Automatic install
+## Local Install
 
-After downloading this folder, ask Codex to run the installer with your own Dokploy API key.
+If this repository is already downloaded locally, the installer can update Codex config.
 
 Windows PowerShell:
 
@@ -78,24 +78,3 @@ Linux/macOS:
 chmod +x ./install-codex.sh
 ./install-codex.sh "<YOUR_DOKPLOY_API_KEY>"
 ```
-
-Then restart Codex completely.
-
-## Manual Codex config template
-
-Keep the normal `@dokploy/mcp` server if you still want raw Dokploy tools. Or add this extra MCP server manually and replace `<YOUR_DOKPLOY_API_KEY>`:
-
-```toml
-[mcp_servers.dokploy_safe]
-command = "node"
-args = ["C:\\Users\\Administrator\\.codex\\mcp\\dokploy-safe-mcp\\server.mjs"]
-enabled = true
-startup_timeout_sec = 120
-
-[mcp_servers.dokploy_safe.env]
-DOKPLOY_URL = "http://183.196.108.32:18080"
-DOKPLOY_PUBLIC_HTTP_URL = "http://183.196.108.32:18080"
-DOKPLOY_API_KEY = "<YOUR_DOKPLOY_API_KEY>"
-```
-
-After editing Codex config, restart Codex so the new MCP tools are loaded.
