@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { z } from "zod";
+import { generatedTools as upstreamDokployTools } from "./vendor/dokploy-mcp/generated/tools.js";
 
 const DOKPLOY_URL = trimTrailingSlash(process.env.DOKPLOY_URL || "http://183.196.108.32:18080");
 const PUBLIC_HTTP_URL = trimTrailingSlash(process.env.DOKPLOY_PUBLIC_HTTP_URL || DOKPLOY_URL);
 const API_KEY = process.env.DOKPLOY_API_KEY;
 const DEFAULT_TIMEOUT_MS = Number(process.env.DOKPLOY_SAFE_TIMEOUT_MS || 180000);
+const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
+const RAW_TOOL_PREFIX = "raw_";
 
 const RESERVED_PATHS = new Set([
 	"api",
@@ -27,6 +32,7 @@ const server = new McpServer({
 		"This server is the single preferred MCP entry point for Dokploy on this host.",
 		"It includes safe deployment/route publishing tools plus common Dokploy inspection and management tools.",
 		"Before deploying to Dokploy or publishing a public path, use dokploy_deploy_static_page or dokploy_publish_route.",
+		"It also exposes the full upstream Dokploy MCP API as raw_* tools for advanced operations.",
 		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
 		"Member API keys normally cannot write Traefik files directly. Use /join/routes through dokploy_publish_route or dokploy_deploy_static_page.",
 		"New public deployments must use a unique path prefix and verify the final public URL returns 200.",
@@ -50,10 +56,21 @@ server.tool(
 		],
 		rawDokployUseCases: [
 			"Use built-in dokploy_* tools in this MCP for common listing, detail, logs, status, and deploy operations.",
-			"Use the upstream @dokploy/mcp only for rare advanced operations not wrapped here.",
+			"Use raw_* tools in this MCP for advanced upstream Dokploy API operations not wrapped by safe tools.",
 		],
 		rules: platformRules(),
 	}),
+);
+
+server.tool(
+	"dokploy_raw_api",
+	"Advanced escape hatch for any Dokploy OpenAPI endpoint. Prefer named safe tools for deployment and route publishing. Use method GET or POST and a path such as /project.all or /compose.update.",
+	{
+		method: z.enum(["GET", "POST"]),
+		path: z.string().describe("Dokploy API path, for example /project.all or /compose.update."),
+		params: z.record(z.any()).optional().describe("GET query parameters or POST JSON body."),
+	},
+	async (input) => jsonToolResult(await dokploy(input.method, normalizeApiPath(input.path), input.params || {})),
 );
 
 server.tool(
@@ -333,6 +350,8 @@ server.tool(
 	},
 );
 
+registerUpstreamDokployTools(server);
+
 async function deployStaticPage(input) {
 	assertConfigured();
 
@@ -577,6 +596,78 @@ async function dokploy(method, path, data) {
 	return httpJson(url, init);
 }
 
+function registerUpstreamDokployTools(mcpServer) {
+	const tools = getEnabledUpstreamTools();
+
+	for (const tool of tools) {
+		const name = `${RAW_TOOL_PREFIX}${tool.name.replace(/-/g, "_")}`;
+		mcpServer.tool(
+			name,
+			[
+				`Upstream Dokploy MCP tool: ${tool.description}.`,
+				"Advanced raw operation. For deployment and public routes on this host, prefer dokploy_deploy_static_page or dokploy_publish_route.",
+			].join(" "),
+			tool.schema.shape,
+			tool.annotations ?? {},
+			async (input) => jsonToolResult(await dokploy(tool.method, tool.path, input || {})),
+		);
+	}
+
+	const originalListToolsHandler = mcpServer.server._requestHandlers.get(ListToolsRequestSchema.shape.method.value);
+	mcpServer.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
+		const result = await originalListToolsHandler(request, extra);
+		return {
+			tools: result.tools.map((tool) => ({
+				...tool,
+				inputSchema: toDraft2020_12JsonSchema(tool.inputSchema),
+			})),
+		};
+	});
+}
+
+function getEnabledUpstreamTools() {
+	const enabledTags = process.env.DOKPLOY_ENABLED_TAGS;
+	if (!enabledTags) {
+		return upstreamDokployTools;
+	}
+
+	const tags = new Set(enabledTags
+		.split(",")
+		.map((tag) => tag.trim().toLowerCase())
+		.filter(Boolean));
+
+	return upstreamDokployTools.filter((tool) => tags.has(tool.tag.toLowerCase()));
+}
+
+function toDraft2020_12JsonSchema(schema) {
+	const result = schema?.type === "object" && schema.properties
+		? structuredClone(schema)
+		: zodToJsonSchema(schema, {
+			target: "jsonSchema2019-09",
+			strictUnions: true,
+		});
+
+	stripNestedSchemaKeys(result);
+	result.$schema = JSON_SCHEMA_2020_12;
+	return result;
+}
+
+function stripNestedSchemaKeys(value) {
+	if (value === null || typeof value !== "object") return;
+	if (Array.isArray(value)) {
+		for (const item of value) stripNestedSchemaKeys(item);
+		return;
+	}
+
+	for (const key of Object.keys(value)) {
+		if (key === "$schema") {
+			delete value[key];
+		} else {
+			stripNestedSchemaKeys(value[key]);
+		}
+	}
+}
+
 async function tryDokploy(method, path, data) {
 	try {
 		return await dokploy(method, path, data);
@@ -702,6 +793,16 @@ function validatePath(path) {
 	if (RESERVED_PATHS.has(slug.toLowerCase())) {
 		throw new Error(`path /${slug} is reserved. Use a unique project path.`);
 	}
+}
+
+function normalizeApiPath(path) {
+	if (!path || typeof path !== "string") {
+		throw new Error("path is required.");
+	}
+
+	const trimmed = path.trim();
+	const withoutApi = trimmed.replace(/^\/?api\//, "");
+	return `/${withoutApi.replace(/^\/+/, "")}`;
 }
 
 function sanitizeName(name) {

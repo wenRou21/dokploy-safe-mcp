@@ -2,7 +2,7 @@
 
 Single MCP entry point for this Dokploy host.
 
-It includes safe deployment tools plus common Dokploy inspection and management tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
+It includes safe deployment tools plus the upstream Dokploy OpenAPI tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
 
 Core safe tools:
 
@@ -17,6 +17,10 @@ Common Dokploy tools included:
 - environment list/create
 - application search/detail/deploy/logs
 - compose search/detail/create/update/deploy/deployments/logs
+
+Full upstream Dokploy API access is also available through `raw_*` tools, for example `raw_project_all`, `raw_compose_update`, and `raw_application_deploy`. Safe deployment tools should still be preferred for public route publishing.
+
+For clients that cannot handle a very large tool list, set `DOKPLOY_ENABLED_TAGS` to a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
 
 The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish routes through `/join/routes`, and verify the final public URL returns 200.
 
