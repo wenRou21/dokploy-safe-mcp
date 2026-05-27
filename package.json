@@ -1,0 +1,21 @@
+{
+  "name": "dokploy-safe-mcp",
+  "version": "1.0.0",
+  "description": "Safe Dokploy deployment wrapper MCP for path-based deployments",
+  "main": "server.mjs",
+  "bin": {
+    "dokploy-safe-mcp": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  }
+}

@@ -1,0 +1,511 @@
+#!/usr/bin/env node
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+const DOKPLOY_URL = trimTrailingSlash(process.env.DOKPLOY_URL || "http://183.196.108.32:18080");
+const PUBLIC_HTTP_URL = trimTrailingSlash(process.env.DOKPLOY_PUBLIC_HTTP_URL || DOKPLOY_URL);
+const API_KEY = process.env.DOKPLOY_API_KEY;
+const DEFAULT_TIMEOUT_MS = Number(process.env.DOKPLOY_SAFE_TIMEOUT_MS || 180000);
+
+const RESERVED_PATHS = new Set([
+	"api",
+	"join",
+	"dashboard",
+	"login",
+	"register",
+	"invitation",
+	"settings",
+	"websocket",
+]);
+
+const server = new McpServer({
+	name: "dokploy-safe-mcp",
+	version: "1.0.0",
+});
+
+server.tool(
+	"dokploy_publish_route",
+	[
+		"Publish a safe path route for an existing Dokploy compose or application.",
+		"This tool never writes Traefik directly. It calls /join/routes, which validates the user's API key,",
+		"creates Host(183.196.108.32) && PathPrefix(/xxx), defaults stripPrefix, reloads Traefik server-side,",
+		"and verifies the public URL on http://183.196.108.32:18080.",
+	].join(" "),
+	{
+		path: z.string().describe("Unique external path prefix, for example /my-site."),
+		composeId: z.string().optional().describe("Dokploy composeId. Use with serviceName and port."),
+		applicationId: z.string().optional().describe("Dokploy applicationId. Use with port."),
+		serviceName: z.string().optional().describe("Compose service name, for example app."),
+		port: z.number().int().positive().describe("Internal container port, not a public host port."),
+		verifyTimeoutMs: z.number().int().positive().optional().describe("Public URL verification timeout in milliseconds."),
+	},
+	async (input) => {
+		const result = await publishRouteAndVerify({
+			path: input.path,
+			composeId: input.composeId,
+			applicationId: input.applicationId,
+			serviceName: input.serviceName,
+			port: input.port,
+			verifyTimeoutMs: input.verifyTimeoutMs,
+		});
+
+		return jsonToolResult(result);
+	},
+);
+
+server.tool(
+	"dokploy_deploy_static_page",
+	[
+		"Deploy a simple static page to Dokploy using nginx:alpine, then publish and verify a safe path route.",
+		"It creates a project, production environment, raw docker-compose compose, forces compose.update with sourceType=raw,",
+		"deploys the compose, publishes through /join/routes, and verifies http://183.196.108.32:18080/<path>/ returns 200.",
+		"Use this instead of manually assuming 80/443 or writing Traefik files.",
+	].join(" "),
+	{
+		name: z.string().optional().describe("Base name for project and compose. A safe unique name is generated if omitted."),
+		path: z.string().optional().describe("Unique external path prefix. A path based on name is generated if omitted."),
+		title: z.string().optional().describe("HTML page title."),
+		html: z.string().optional().describe("Full HTML content. If omitted, a simple static page is generated."),
+		verifyTimeoutMs: z.number().int().positive().optional().describe("Deployment and public URL verification timeout in milliseconds."),
+	},
+	async (input) => {
+		const result = await deployStaticPage(input);
+		return jsonToolResult(result);
+	},
+);
+
+async function deployStaticPage(input) {
+	assertConfigured();
+
+	const stamp = timestampSlug();
+	const random = Math.random().toString(36).slice(2, 8);
+	const baseName = sanitizeName(input.name || `safe-static-${stamp}-${random}`);
+	const path = normalizePath(input.path || `/${baseName}`);
+	validatePath(path);
+
+	const projectName = baseName;
+	const environmentName = "production";
+	const composeName = `${baseName}-compose`;
+	const serviceName = "app";
+	const port = 80;
+	const title = input.title || "Dokploy Safe Static Page";
+	const html = input.html || defaultHtml(title, path);
+	const composeFile = buildStaticCompose(serviceName, html);
+	const startedAt = new Date().toISOString();
+
+	const project = await dokploy("POST", "/project.create", {
+		name: projectName,
+		description: "Static page deployed through dokploy-safe-mcp",
+	});
+	const projectId = pickId(project, "projectId");
+	const environment = project.environment || await dokploy("POST", "/environment.create", {
+		name: environmentName,
+		description: "Created by dokploy-safe-mcp",
+		projectId,
+	});
+	const environmentId = pickId(environment, "environmentId");
+
+	const compose = await dokploy("POST", "/compose.create", {
+		name: composeName,
+		description: "Static nginx page deployed through dokploy-safe-mcp",
+		environmentId,
+		composeType: "docker-compose",
+		appName: composeName,
+		composeFile,
+	});
+	const composeId = pickId(compose, "composeId");
+
+	await dokploy("POST", "/compose.update", {
+		composeId,
+		name: composeName,
+		appName: composeName,
+		description: "Static nginx page deployed through dokploy-safe-mcp",
+		composeFile,
+		sourceType: "raw",
+		composeType: "docker-compose",
+		composeStatus: "idle",
+		repository: null,
+		owner: null,
+		branch: null,
+		autoDeploy: false,
+	});
+
+	await dokploy("POST", "/compose.deploy", {
+		composeId,
+		title: "Deploy static page",
+		description: "dokploy-safe-mcp deploy_static_page",
+	});
+
+	const timeoutMs = input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS;
+	const deployment = await waitForComposeDeployment(composeId, timeoutMs);
+	const route = await publishRouteAndVerify({
+		path,
+		composeId,
+		serviceName,
+		port,
+		verifyTimeoutMs: timeoutMs,
+	});
+
+	return {
+		ok: true,
+		kind: "static-compose",
+		message: "Static page deployed, route published, and public URL verified.",
+		url: route.url,
+		path,
+		projectId,
+		environmentId,
+		composeId,
+		serviceName,
+		port,
+		deployment,
+		route,
+		startedAt,
+		completedAt: new Date().toISOString(),
+		rulesApplied: platformRules(),
+	};
+}
+
+async function publishRouteAndVerify(input) {
+	assertConfigured();
+
+	const path = normalizePath(input.path);
+	validatePath(path);
+	const hasCompose = Boolean(input.composeId);
+	const hasApplication = Boolean(input.applicationId);
+
+	if (hasCompose === hasApplication) {
+		throw new Error("Provide exactly one target: composeId or applicationId.");
+	}
+
+	if (hasCompose && !input.serviceName) {
+		throw new Error("serviceName is required when publishing a compose route.");
+	}
+
+	const port = Number(input.port);
+	if (!Number.isInteger(port) || port <= 0) {
+		throw new Error("port must be a positive internal container port.");
+	}
+
+	const body = {
+		apiKey: API_KEY,
+		path,
+		port,
+	};
+
+	if (hasCompose) {
+		body.composeId = input.composeId;
+		body.serviceName = input.serviceName;
+	} else {
+		body.applicationId = input.applicationId;
+	}
+
+	const route = await httpJson(`${DOKPLOY_URL}/join/routes`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Accept: "application/json" },
+		body: JSON.stringify(body),
+		timeoutMs: 60000,
+	});
+
+	const url = route.url || `${PUBLIC_HTTP_URL}${path.endsWith("/") ? path : `${path}/`}`;
+	const verification = await waitForPublicUrl(url, input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS);
+
+	return {
+		ok: true,
+		kind: hasCompose ? "compose" : "application",
+		message: "Route published through /join/routes and public URL verified.",
+		path,
+		url,
+		targetUrl: route.targetUrl,
+		ownerId: route.ownerId,
+		target: hasCompose
+			? { composeId: input.composeId, serviceName: input.serviceName, port }
+			: { applicationId: input.applicationId, port },
+		verification,
+		rulesApplied: platformRules(),
+	};
+}
+
+async function waitForComposeDeployment(composeId, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	let lastStatus = "unknown";
+	let lastDeployment = null;
+
+	while (Date.now() < deadline) {
+		const compose = await dokploy("GET", "/compose.one", { composeId });
+		lastStatus = compose.composeStatus || compose.status || lastStatus;
+		lastDeployment = latestDeployment(await tryDokploy("GET", "/deployment.allByCompose", { composeId }));
+
+		const deploymentStatus = statusOf(lastDeployment);
+		if (lastStatus === "done" || deploymentStatus === "done" || deploymentStatus === "success") {
+			return {
+				ok: true,
+				composeStatus: lastStatus,
+				deploymentStatus,
+				deploymentId: lastDeployment?.deploymentId || lastDeployment?.id,
+			};
+		}
+
+		if (lastStatus === "error" || deploymentStatus === "error" || deploymentStatus === "failed") {
+			throw new Error(`Compose deployment failed. composeStatus=${lastStatus}, deploymentStatus=${deploymentStatus}`);
+		}
+
+		await delay(4000);
+	}
+
+	throw new Error(`Timed out waiting for compose deployment. Last composeStatus=${lastStatus}, last deploymentStatus=${statusOf(lastDeployment)}`);
+}
+
+async function waitForPublicUrl(url, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	let last = null;
+
+	while (Date.now() < deadline) {
+		try {
+			const response = await fetch(url, {
+				method: "GET",
+				headers: { Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8" },
+				redirect: "follow",
+				signal: AbortSignal.timeout(10000),
+			});
+			const text = await response.text();
+			last = {
+				status: response.status,
+				finalUrl: response.url,
+				contentType: response.headers.get("content-type"),
+				snippet: text.replace(/\s+/g, " ").slice(0, 240),
+			};
+			if (response.status === 200) {
+				return {
+					ok: true,
+					status: response.status,
+					finalUrl: response.url,
+					contentType: last.contentType,
+					snippet: last.snippet,
+				};
+			}
+		} catch (error) {
+			last = { error: error.message };
+		}
+
+		await delay(3000);
+	}
+
+	throw new Error(`Public URL verification failed for ${url}. Last result: ${JSON.stringify(last)}`);
+}
+
+async function dokploy(method, path, data) {
+	const url = new URL(`${DOKPLOY_URL}/api${path}`);
+	const init = {
+		method,
+		headers: {
+			"x-api-key": API_KEY,
+			Accept: "application/json",
+			"Content-Type": "application/json",
+		},
+		timeoutMs: 60000,
+	};
+
+	if (method === "GET") {
+		for (const [key, value] of Object.entries(data || {})) {
+			if (value !== undefined && value !== null) {
+				url.searchParams.set(key, String(value));
+			}
+		}
+	} else {
+		init.body = JSON.stringify(data || {});
+	}
+
+	return httpJson(url, init);
+}
+
+async function tryDokploy(method, path, data) {
+	try {
+		return await dokploy(method, path, data);
+	} catch {
+		return null;
+	}
+}
+
+async function httpJson(url, init) {
+	const timeoutMs = init.timeoutMs || 60000;
+	const response = await fetch(url, {
+		method: init.method,
+		headers: init.headers,
+		body: init.body,
+		signal: AbortSignal.timeout(timeoutMs),
+	});
+	const text = await response.text();
+	let parsed;
+
+	try {
+		parsed = text ? JSON.parse(text) : null;
+	} catch {
+		parsed = text;
+	}
+
+	if (!response.ok) {
+		const message = typeof parsed === "object" && parsed
+			? parsed.message || parsed.error || JSON.stringify(parsed)
+			: String(parsed || response.statusText);
+		throw new Error(`HTTP ${response.status} ${response.statusText} from ${response.url}: ${message}`);
+	}
+
+	return parsed;
+}
+
+function buildStaticCompose(serviceName, html) {
+	const encodedHtml = Buffer.from(html, "utf8").toString("base64");
+
+	return [
+		"services:",
+		`  ${serviceName}:`,
+		"    image: nginx:alpine",
+		"    restart: unless-stopped",
+		"    command:",
+		"      - /bin/sh",
+		"      - -c",
+		`      - printf '%s' '${encodedHtml}' | base64 -d > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'`,
+	].join("\n");
+}
+
+function defaultHtml(title, path) {
+	const now = new Date().toISOString();
+	return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: light; font-family: Arial, "Microsoft YaHei", sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f7f9; color: #17202a; }
+    main { width: min(720px, calc(100vw - 40px)); padding: 36px; background: white; border: 1px solid #dfe4ea; border-radius: 8px; box-shadow: 0 18px 50px rgba(20, 35, 50, .08); }
+    h1 { margin: 0 0 12px; font-size: 30px; line-height: 1.2; }
+    p { margin: 8px 0; color: #4d5b6a; line-height: 1.7; }
+    code { padding: 2px 6px; border-radius: 4px; background: #eef2f6; color: #1f2d3d; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(title)}</h1>
+    <p>这个静态页面由 <code>dokploy-safe-mcp</code> 自动部署并发布路径。</p>
+    <p>访问路径：<code>${escapeHtml(path)}</code></p>
+    <p>部署时间：<code>${escapeHtml(now)}</code></p>
+  </main>
+</body>
+</html>`;
+}
+
+function latestDeployment(value) {
+	const rows = Array.isArray(value) ? value : value?.deployments || value?.data || [];
+	if (!Array.isArray(rows) || rows.length === 0) return null;
+
+	return [...rows].sort((a, b) => {
+		const ad = Date.parse(a.createdAt || a.created_at || 0);
+		const bd = Date.parse(b.createdAt || b.created_at || 0);
+		return bd - ad;
+	})[0];
+}
+
+function statusOf(value) {
+	return (value?.status || value?.deploymentStatus || value?.state || value?.composeStatus || "").toString().toLowerCase();
+}
+
+function pickId(value, field) {
+	if (value?.[field]) return value[field];
+	if (value?.data?.[field]) return value.data[field];
+	if (value?.project?.[field]) return value.project[field];
+	if (value?.environment?.[field]) return value.environment[field];
+	if (value?.compose?.[field]) return value.compose[field];
+	if (value?.application?.[field]) return value.application[field];
+	throw new Error(`Dokploy response did not include ${field}: ${JSON.stringify(value)}`);
+}
+
+function normalizePath(path) {
+	if (!path || typeof path !== "string") {
+		throw new Error("path is required.");
+	}
+
+	const trimmed = path.trim();
+	return `/${trimmed.replace(/^\/+/, "").replace(/\/+$/, "")}`;
+}
+
+function validatePath(path) {
+	const slug = path.slice(1);
+	if (!slug) {
+		throw new Error("path must not be root (/). Use a unique prefix such as /my-site.");
+	}
+
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(slug)) {
+		throw new Error("path may only contain letters, numbers, dots, underscores, and hyphens, for example /my-site.");
+	}
+
+	if (RESERVED_PATHS.has(slug.toLowerCase())) {
+		throw new Error(`path /${slug} is reserved. Use a unique project path.`);
+	}
+}
+
+function sanitizeName(name) {
+	const safe = String(name)
+		.toLowerCase()
+		.replace(/[^a-z0-9._-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 48);
+
+	return safe || `safe-static-${timestampSlug()}`;
+}
+
+function timestampSlug() {
+	const d = new Date();
+	const pad = (n) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+function trimTrailingSlash(value) {
+	return value.replace(/\/+$/, "");
+}
+
+function escapeHtml(value) {
+	return String(value)
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+function delay(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function assertConfigured() {
+	if (!API_KEY) {
+		throw new Error("DOKPLOY_API_KEY is required in the MCP server environment.");
+	}
+}
+
+function platformRules() {
+	return [
+		"Use http://183.196.108.32:18080 as the public HTTP entry; do not assume 80/443.",
+		"Use a unique path prefix for each project.",
+		"Member API keys do not write Traefik directly; traefikFiles.write=false is normal.",
+		"Publish routes through POST /join/routes.",
+		"/join/routes creates Host(183.196.108.32) && PathPrefix(/xxx) and defaults stripPrefix.",
+		"Compose targets use serviceName + internal port; application targets use applicationId + internal port.",
+		"Never point services at localhost.",
+	];
+}
+
+function jsonToolResult(value) {
+	return {
+		content: [
+			{
+				type: "text",
+				text: JSON.stringify(value, null, 2),
+			},
+		],
+	};
+}
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
