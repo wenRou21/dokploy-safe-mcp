@@ -477,20 +477,65 @@ async function publishRouteAndVerify(input) {
 		body.applicationId = input.applicationId;
 	}
 
-	const route = await httpJson(`${DOKPLOY_URL}/join/routes`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", Accept: "application/json" },
-		body: JSON.stringify(body),
-		timeoutMs: 60000,
-	});
+	const attempts = [];
+	const verifyTimeoutMs = input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS;
+	let route = null;
+	let verification = null;
+	let url = null;
 
-	const url = route.url || `${PUBLIC_HTTP_URL}${path.endsWith("/") ? path : `${path}/`}`;
-	const verification = await waitForPublicUrl(url, input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS);
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		try {
+			route = await publishRoute(body);
+			url = route.url || `${PUBLIC_HTTP_URL}${path.endsWith("/") ? path : `${path}/`}`;
+		} catch (error) {
+			if (!isRouteAlreadyOwnedError(error) || !url) {
+				throw error;
+			}
+
+			attempts.push({
+				attempt,
+				ok: false,
+				phase: "publish",
+				routeAlreadyExists: true,
+				error: error.message,
+			});
+		}
+
+		try {
+			verification = await waitForPublicUrl(url, perAttemptTimeout(verifyTimeoutMs, attempt));
+			attempts.push({
+				attempt,
+				ok: true,
+				targetUrl: route.targetUrl,
+				verification,
+			});
+			break;
+		} catch (error) {
+			attempts.push({
+				attempt,
+				ok: false,
+				phase: "verify",
+				targetUrl: route.targetUrl,
+				error: error.message,
+			});
+
+			if (attempt === 3) {
+				throw new Error([
+					`Route was published but public URL verification failed for ${url}.`,
+					"This often means Traefik cannot resolve the target container alias yet, or the route-manager did not attach the container to the public bridge with the expected alias.",
+					"If attempts include routeAlreadyExists=true, /join/routes is not idempotently refreshing an existing route; update route-manager so same path + same owner re-runs the network alias repair instead of returning reserved.",
+					`Attempts: ${JSON.stringify(attempts)}`,
+				].join(" "));
+			}
+
+			await delay(5000 * attempt);
+		}
+	}
 
 	return {
 		ok: true,
 		kind: hasCompose ? "compose" : "application",
-		message: "Route published through /join/routes and public URL verified.",
+		message: "Route published through /join/routes and public URL verified. If earlier attempts failed, /join/routes was retried to refresh the container network alias.",
 		path,
 		url,
 		targetUrl: route.targetUrl,
@@ -499,8 +544,31 @@ async function publishRouteAndVerify(input) {
 			? { composeId: input.composeId, serviceName: input.serviceName, port }
 			: { applicationId: input.applicationId, port },
 		verification,
+		attempts,
 		rulesApplied: platformRules(),
 	};
+}
+
+async function publishRoute(body) {
+	return httpJson(`${DOKPLOY_URL}/join/routes`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Accept: "application/json" },
+		body: JSON.stringify(body),
+		timeoutMs: 60000,
+	});
+}
+
+function isRouteAlreadyOwnedError(error) {
+	const message = error?.message || "";
+	return message.includes("Path is reserved or already owned")
+		|| message.includes("already owned by another route")
+		|| message.includes("reserved");
+}
+
+function perAttemptTimeout(totalTimeoutMs, attempt) {
+	const minimum = 20000;
+	const remainingAttempts = 4 - attempt;
+	return Math.max(minimum, Math.floor(totalTimeoutMs / remainingAttempts));
 }
 
 async function waitForComposeDeployment(composeId, timeoutMs) {
