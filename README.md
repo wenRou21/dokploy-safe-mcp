@@ -30,27 +30,27 @@ The safe deployment tools always use the public entry `http://183.196.108.32:180
 
 For real projects that are too large to embed into MCP JSON, use:
 
-- `dokploy_prepare_upload_slot`: creates a remote upload directory on the Dokploy host and returns an SCP example.
-- `dokploy_deploy_from_local_archive`: accepts a local directory or archive, uploads it to the Dokploy host over SSH/SCP, creates a raw Dokploy compose, deploys it, publishes a `/join/routes` path, and verifies HTTP 200.
+- `dokploy_prepare_upload_slot`: returns the configured HTTP upload gateway and size limit.
+- `dokploy_deploy_from_local_archive`: accepts a local directory or archive, uploads it to the Dokploy host over HTTP multipart, creates a raw Dokploy compose, deploys it, publishes a `/join/routes` path, and verifies HTTP 200.
+
+The upload gateway accepts the archive and returns a deployment task immediately; the MCP then polls the task status until the server-side Dokploy deployment and public URL verification finish. This avoids long-lived upload HTTP requests during large builds.
 
 Supported `dokploy_deploy_from_local_archive` modes:
 
 - `static`: serve uploaded static files through `nginx:alpine`.
 - `dockerfile`: build an uploaded `Dockerfile`.
-- `compose`: deploy an uploaded `docker-compose.yml` and publish one service.
+- `auto`: let the upload gateway choose Dockerfile, static, Node, or Python templates.
+- `railpack`: reserved for future Railpack/Nixpacks integration; currently returns a clear server-side error if unavailable.
 
-The machine running Codex/MCP must have `ssh`, `scp`, and `tar` available. For `.zip` uploads, the Dokploy host must have `unzip` available. Optional SSH settings:
+The machine running Codex/MCP must have `tar` available for directory uploads. Optional upload settings:
 
 ```toml
 [mcp_servers.dokploy_safe.env]
-DOKPLOY_SSH_HOST = "183.196.108.32"
-DOKPLOY_SSH_USER = "root"
-DOKPLOY_SSH_PORT = "22"
-DOKPLOY_SSH_IDENTITY_FILE = "/path/to/private/key"
-DOKPLOY_UPLOAD_ROOT = "/etc/dokploy/uploads"
+DOKPLOY_UPLOAD_URL = "http://183.196.108.32:18080/join/deployments"
+DOKPLOY_UPLOAD_MAX_MB = "500"
 ```
 
-If these are omitted, the MCP defaults to `root@<DOKPLOY_URL host>` and `/etc/dokploy/uploads`.
+If these are omitted, the MCP defaults to `${DOKPLOY_PUBLIC_HTTP_URL}/join/deployments` and a 500MB upload limit. SSH/SCP is no longer required for normal users.
 
 ## Recommended Codex Config
 
