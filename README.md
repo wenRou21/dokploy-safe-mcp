@@ -10,6 +10,8 @@ Core safe tools:
 - `dokploy_connection_check`
 - `dokploy_deploy_static_page`
 - `dokploy_publish_route`
+- `dokploy_prepare_upload_slot`
+- `dokploy_deploy_from_local_archive`
 
 Common Dokploy tools included:
 
@@ -23,6 +25,32 @@ Full upstream Dokploy API access is also available through `raw_*` tools, for ex
 For clients that cannot handle a very large tool list, set `DOKPLOY_ENABLED_TAGS` to a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
 
 The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish routes through `/join/routes`, and verify the final public URL returns 200.
+
+## Local Project Uploads
+
+For real projects that are too large to embed into MCP JSON, use:
+
+- `dokploy_prepare_upload_slot`: creates a remote upload directory on the Dokploy host and returns an SCP example.
+- `dokploy_deploy_from_local_archive`: accepts a local directory or archive, uploads it to the Dokploy host over SSH/SCP, creates a raw Dokploy compose, deploys it, publishes a `/join/routes` path, and verifies HTTP 200.
+
+Supported `dokploy_deploy_from_local_archive` modes:
+
+- `static`: serve uploaded static files through `nginx:alpine`.
+- `dockerfile`: build an uploaded `Dockerfile`.
+- `compose`: deploy an uploaded `docker-compose.yml` and publish one service.
+
+The machine running Codex/MCP must have `ssh`, `scp`, and `tar` available. For `.zip` uploads, the Dokploy host must have `unzip` available. Optional SSH settings:
+
+```toml
+[mcp_servers.dokploy_safe.env]
+DOKPLOY_SSH_HOST = "183.196.108.32"
+DOKPLOY_SSH_USER = "root"
+DOKPLOY_SSH_PORT = "22"
+DOKPLOY_SSH_IDENTITY_FILE = "/path/to/private/key"
+DOKPLOY_UPLOAD_ROOT = "/etc/dokploy/uploads"
+```
+
+If these are omitted, the MCP defaults to `root@<DOKPLOY_URL host>` and `/etc/dokploy/uploads`.
 
 ## Recommended Codex Config
 

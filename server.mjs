@@ -2,6 +2,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { z } from "zod";
 import { generatedTools as upstreamDokployTools } from "./vendor/dokploy-mcp/generated/tools.js";
@@ -12,6 +16,11 @@ const API_KEY = process.env.DOKPLOY_API_KEY;
 const DEFAULT_TIMEOUT_MS = Number(process.env.DOKPLOY_SAFE_TIMEOUT_MS || 180000);
 const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const RAW_TOOL_PREFIX = "raw_";
+const SSH_HOST = process.env.DOKPLOY_SSH_HOST || safeUrlHost(DOKPLOY_URL) || "183.196.108.32";
+const SSH_USER = process.env.DOKPLOY_SSH_USER || "root";
+const SSH_PORT = process.env.DOKPLOY_SSH_PORT || "";
+const SSH_IDENTITY_FILE = process.env.DOKPLOY_SSH_IDENTITY_FILE || "";
+const REMOTE_UPLOAD_ROOT = process.env.DOKPLOY_UPLOAD_ROOT || "/etc/dokploy/uploads";
 
 const RESERVED_PATHS = new Set([
 	"api",
@@ -328,6 +337,48 @@ server.tool(
 );
 
 server.tool(
+	"dokploy_prepare_upload_slot",
+	[
+		"Create a remote upload directory on the Dokploy host for a project archive.",
+		"Use this when a colleague has a larger local project that should not be embedded into MCP JSON.",
+		"Requires SSH access from the local machine running this MCP to the Dokploy host.",
+	].join(" "),
+	{
+		name: z.string().optional().describe("Optional human-readable project name for the upload directory."),
+	},
+	async (input) => {
+		const result = await prepareUploadSlot(input.name);
+		return jsonToolResult(result);
+	},
+);
+
+server.tool(
+	"dokploy_deploy_from_local_archive",
+	[
+		"Deploy a local archive or directory by uploading it to the Dokploy host first.",
+		"This avoids embedding large source code blobs into MCP JSON or docker-compose.",
+		"Modes: static serves existing static files with nginx; dockerfile builds a Dockerfile; compose deploys an uploaded docker-compose file.",
+		"The MCP creates a Dokploy raw compose, deploys it, publishes through /join/routes, and verifies the public URL.",
+	].join(" "),
+	{
+		sourcePath: z.string().describe("Local path on the machine running Codex/MCP. Can be a directory, .zip, .tar, .tar.gz, or .tgz."),
+		name: z.string().optional().describe("Base project name. Defaults to the source path name plus a timestamp."),
+		path: z.string().optional().describe("Unique public path prefix, for example /burst-guardians. Defaults to /<name>."),
+		mode: z.enum(["static", "dockerfile", "compose"]).default("dockerfile"),
+		port: z.number().int().positive().default(80).describe("Internal container port to publish."),
+		dockerfilePath: z.string().default("Dockerfile"),
+		composeFilePath: z.string().default("docker-compose.yml"),
+		serviceName: z.string().default("app").describe("Service to publish in compose mode."),
+		env: z.record(z.string()).default({}).describe("Environment variables for generated dockerfile/static compose modes."),
+		verifyTimeoutMs: z.number().int().positive().optional().describe("Deployment and public URL verification timeout in milliseconds."),
+	},
+	async (input) => {
+		const result = await deployFromLocalArchive(input);
+		return jsonToolResult(result);
+	},
+);
+
+server.tool(
 	"dokploy_deploy_static_page",
 	[
 		"Preferred tool for deploying a simple static page to this Dokploy host.",
@@ -441,6 +492,134 @@ async function deployStaticPage(input) {
 		completedAt: new Date().toISOString(),
 		rulesApplied: platformRules(),
 	};
+}
+
+async function prepareUploadSlot(name) {
+	const baseName = sanitizeName(name || `upload-${timestampSlug()}`);
+	const slotName = `${baseName}-${Math.random().toString(36).slice(2, 8)}`;
+	const remoteDir = `${REMOTE_UPLOAD_ROOT.replace(/\/+$/, "")}/${slotName}`;
+	await ssh(["mkdir", "-p", remoteDir]);
+
+	return {
+		ok: true,
+		uploadDir: remoteDir,
+		sshTarget: sshTarget(),
+		exampleScp: `scp ./project.zip ${sshPortFlagForExample()}${SSH_USER}@${SSH_HOST}:${shellQuote(remoteDir)}/`,
+		nextTool: "dokploy_deploy_from_local_archive",
+		sourcePathNote: "For npx/client MCP, pass your local path to dokploy_deploy_from_local_archive; it will upload automatically.",
+	};
+}
+
+async function deployFromLocalArchive(input) {
+	assertConfigured();
+	const localSource = path.resolve(String(input.sourcePath || ""));
+	const sourceStat = await fs.stat(localSource);
+	const stamp = timestampSlug();
+	const baseName = sanitizeName(input.name || path.basename(localSource, path.extname(localSource)) || `archive-${stamp}`);
+	const deployName = sanitizeName(`${baseName}-${stamp}`);
+	const publicPath = normalizePath(input.path || `/${deployName}`);
+	validatePath(publicPath);
+
+	const remoteWorkDir = `${REMOTE_UPLOAD_ROOT.replace(/\/+$/, "")}/${deployName}`;
+	const localPayload = await makeLocalPayload(localSource, sourceStat, deployName);
+	const remoteArchive = `${remoteWorkDir}/source.${localPayload.extension}`;
+	const remoteCodeDir = `${remoteWorkDir}/code`;
+	const startedAt = new Date().toISOString();
+
+	try {
+		await ssh(["mkdir", "-p", remoteWorkDir]);
+		await scp(localPayload.path, `${sshTarget()}:${remoteArchive}`);
+		await ssh(["rm", "-rf", remoteCodeDir]);
+		await ssh(["mkdir", "-p", remoteCodeDir]);
+		await extractRemotePayload(remoteArchive, remoteCodeDir, localPayload.kind);
+
+		const composeFile = buildUploadedProjectCompose({
+			mode: input.mode || "dockerfile",
+			port: input.port || 80,
+			dockerfilePath: input.dockerfilePath || "Dockerfile",
+			composeFilePath: input.composeFilePath || "docker-compose.yml",
+			serviceName: input.serviceName || "app",
+			env: input.env || {},
+			remoteCodeDir,
+		});
+		const project = await dokploy("POST", "/project.create", {
+			name: deployName,
+			description: "Local archive uploaded and deployed through dokploy-safe-mcp",
+		});
+		const projectId = pickId(project, "projectId");
+		const environment = project.environment || await dokploy("POST", "/environment.create", {
+			name: "production",
+			description: "Created by dokploy-safe-mcp",
+			projectId,
+		});
+		const environmentId = pickId(environment, "environmentId");
+
+		const composeName = `${deployName}-compose`;
+		const compose = await dokploy("POST", "/compose.create", {
+			name: composeName,
+			description: "Local archive deployment through dokploy-safe-mcp",
+			environmentId,
+			composeType: "docker-compose",
+			appName: composeName,
+			composeFile,
+		});
+		const composeId = pickId(compose, "composeId");
+
+		await dokploy("POST", "/compose.update", {
+			composeId,
+			name: composeName,
+			appName: composeName,
+			description: "Local archive deployment through dokploy-safe-mcp",
+			composeFile,
+			sourceType: "raw",
+			composeType: "docker-compose",
+			composeStatus: "idle",
+			repository: null,
+			owner: null,
+			branch: null,
+			autoDeploy: false,
+		});
+
+		await dokploy("POST", "/compose.deploy", {
+			composeId,
+			title: "Deploy local archive",
+			description: "dokploy-safe-mcp deploy_from_local_archive",
+		});
+
+		const timeoutMs = input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS;
+		const deployment = await waitForComposeDeployment(composeId, timeoutMs);
+		const route = await publishRouteAndVerify({
+			path: publicPath,
+			composeId,
+			serviceName: input.mode === "compose" ? input.serviceName || "app" : "app",
+			port: input.port || 80,
+			verifyTimeoutMs: timeoutMs,
+		});
+
+		return {
+			ok: true,
+			kind: "local-archive-compose",
+			message: "Local source uploaded, deployed as a raw Dokploy compose, route published, and public URL verified.",
+			url: route.url,
+			path: publicPath,
+			projectId,
+			environmentId,
+			composeId,
+			serviceName: input.mode === "compose" ? input.serviceName || "app" : "app",
+			port: input.port || 80,
+			mode: input.mode || "dockerfile",
+			remoteWorkDir,
+			startedAt,
+			completedAt: new Date().toISOString(),
+			deployment,
+			route,
+			rulesApplied: platformRules(),
+		};
+	} finally {
+		if (localPayload.cleanup) {
+			await fs.rm(localPayload.path, { force: true }).catch(() => undefined);
+		}
+	}
 }
 
 async function publishRouteAndVerify(input) {
@@ -786,6 +965,48 @@ function buildStaticCompose(serviceName, html) {
 	].join("\n");
 }
 
+function buildUploadedProjectCompose(input) {
+	const serviceName = input.mode === "compose" ? input.serviceName : "app";
+
+	if (input.mode === "compose") {
+		return [
+			"include:",
+			`  - ${yamlString(`${input.remoteCodeDir}/${input.composeFilePath}`)}`,
+			"",
+		].join("\n");
+	}
+
+	const envLines = Object.entries(input.env || {})
+		.map(([key, value]) => `      ${yamlKey(key)}: ${yamlString(value)}`);
+	const environmentBlock = envLines.length
+		? ["    environment:", ...envLines]
+		: [];
+
+	if (input.mode === "static") {
+		return [
+			"services:",
+			"  app:",
+			"    image: nginx:alpine",
+			"    restart: unless-stopped",
+			"    volumes:",
+			`      - ${yamlString(`${input.remoteCodeDir}:/usr/share/nginx/html:ro`)}`,
+			...environmentBlock,
+			"",
+		].join("\n");
+	}
+
+	return [
+		"services:",
+		"  app:",
+		"    build:",
+		`      context: ${yamlString(input.remoteCodeDir)}`,
+		`      dockerfile: ${yamlString(input.dockerfilePath)}`,
+		"    restart: unless-stopped",
+		...environmentBlock,
+		"",
+	].join("\n");
+}
+
 function defaultHtml(title, path) {
 	const now = new Date().toISOString();
 	return `<!doctype html>
@@ -891,6 +1112,14 @@ function sanitizeName(name) {
 	return safe || `safe-static-${timestampSlug()}`;
 }
 
+function safeUrlHost(value) {
+	try {
+		return new URL(value).hostname;
+	} catch {
+		return "";
+	}
+}
+
 function timestampSlug() {
 	const d = new Date();
 	const pad = (n) => String(n).padStart(2, "0");
@@ -907,6 +1136,140 @@ function escapeHtml(value) {
 		.replace(/</g, "&lt;")
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;");
+}
+
+function yamlString(value) {
+	return JSON.stringify(String(value));
+}
+
+function yamlKey(value) {
+	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+		throw new Error(`Invalid environment variable name: ${value}`);
+	}
+
+	return value;
+}
+
+async function makeLocalPayload(sourcePath, sourceStat, name) {
+	if (!sourceStat.isDirectory()) {
+		const lower = sourcePath.toLowerCase();
+		if (lower.endsWith(".zip")) {
+			return { path: sourcePath, kind: "zip", extension: "zip", cleanup: false };
+		}
+		if (lower.endsWith(".tar")) {
+			return { path: sourcePath, kind: "tar", extension: "tar", cleanup: false };
+		}
+		if (lower.endsWith(".tar.gz") || lower.endsWith(".tgz")) {
+			return { path: sourcePath, kind: "tgz", extension: "tgz", cleanup: false };
+		}
+	}
+
+	const archivePath = path.join(os.tmpdir(), `dokploy-safe-${name}-${Date.now()}.tgz`);
+	const cwd = sourceStat.isDirectory() ? sourcePath : path.dirname(sourcePath);
+	const item = sourceStat.isDirectory() ? "." : path.basename(sourcePath);
+	await runLocal("tar", ["-czf", archivePath, "-C", cwd, item], 120000);
+	return { path: archivePath, kind: "tgz", extension: "tgz", cleanup: true };
+}
+
+async function extractRemotePayload(remoteArchive, remoteCodeDir, kind) {
+	if (kind === "zip") {
+		await ssh(["unzip", "-q", remoteArchive, "-d", remoteCodeDir]);
+		await flattenRemoteSingleRoot(remoteCodeDir);
+		return;
+	}
+
+	if (kind === "tar" || kind === "tgz") {
+		await ssh(["tar", "-xf", remoteArchive, "-C", remoteCodeDir]);
+		await flattenRemoteSingleRoot(remoteCodeDir);
+		return;
+	}
+
+	throw new Error(`Unsupported upload payload kind: ${kind}`);
+}
+
+async function flattenRemoteSingleRoot(remoteCodeDir) {
+	const script = [
+		"set -e",
+		`cd ${shellQuote(remoteCodeDir)}`,
+		"count=$(find . -mindepth 1 -maxdepth 1 ! -name '__MACOSX' | wc -l)",
+		"if [ \"$count\" = \"1\" ]; then",
+		"  only=$(find . -mindepth 1 -maxdepth 1 ! -name '__MACOSX' | head -n 1)",
+		"  if [ -d \"$only\" ]; then",
+		"    tmp=$(mktemp -d)",
+		"    find \"$only\" -mindepth 1 -maxdepth 1 -exec mv {} \"$tmp\"/ \\;",
+		"    rm -rf \"$only\"",
+		"    find \"$tmp\" -mindepth 1 -maxdepth 1 -exec mv {} . \\;",
+		"    rmdir \"$tmp\"",
+		"  fi",
+		"fi",
+	].join("; ");
+	await ssh(["sh", "-lc", script]);
+}
+
+async function ssh(args) {
+	const sshArgs = [
+		...sshCommonArgs(),
+		sshTarget(),
+		shellJoin(args),
+	];
+	return runLocal("ssh", sshArgs, 120000);
+}
+
+async function scp(source, destination) {
+	const args = [
+		...scpCommonArgs(),
+		source,
+		destination,
+	];
+	return runLocal("scp", args, 180000);
+}
+
+function sshTarget() {
+	return `${SSH_USER}@${SSH_HOST}`;
+}
+
+function sshCommonArgs() {
+	return [
+		...(SSH_PORT ? ["-p", SSH_PORT] : []),
+		...(SSH_IDENTITY_FILE ? ["-i", SSH_IDENTITY_FILE] : []),
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+	];
+}
+
+function scpCommonArgs() {
+	return [
+		...(SSH_PORT ? ["-P", SSH_PORT] : []),
+		...(SSH_IDENTITY_FILE ? ["-i", SSH_IDENTITY_FILE] : []),
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+	];
+}
+
+function sshPortFlagForExample() {
+	return SSH_PORT ? `-P ${SSH_PORT} ` : "";
+}
+
+function shellJoin(args) {
+	return args.map(shellQuote).join(" ");
+}
+
+function shellQuote(value) {
+	return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function runLocal(command, args, timeoutMs) {
+	return new Promise((resolve, reject) => {
+		execFile(command, args, { timeout: timeoutMs }, (error, stdout, stderr) => {
+			if (error) {
+				const message = stderr?.trim() || stdout?.trim() || error.message;
+				reject(new Error(`${command} failed: ${message}`));
+				return;
+			}
+
+			resolve({ stdout, stderr });
+		});
+	});
 }
 
 function delay(ms) {
