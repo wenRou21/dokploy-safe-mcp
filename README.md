@@ -2,7 +2,7 @@
 
 Single MCP entry point for this Dokploy host.
 
-It includes safe deployment tools plus the upstream Dokploy OpenAPI tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
+It includes high-level deployment workflow tools plus the upstream Dokploy OpenAPI tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
 
 Core safe tools:
 
@@ -10,8 +10,12 @@ Core safe tools:
 - `dokploy_connection_check`
 - `dokploy_deploy_static_page`
 - `dokploy_publish_route`
+- `dokploy_unpublish_route`
 - `dokploy_prepare_upload_slot`
 - `dokploy_deploy_from_local_archive`
+- `dokploy_get_project_status`
+- `dokploy_delete_project`
+- `dokploy_cleanup_failed_deploy`
 
 Common Dokploy tools included:
 
@@ -20,11 +24,11 @@ Common Dokploy tools included:
 - application search/detail/deploy/logs
 - compose search/detail/create/update/deploy/deployments/logs
 
-Full upstream Dokploy API access is also available through `raw_*` tools, for example `raw_project_all`, `raw_compose_update`, and `raw_application_deploy`. Safe deployment tools should still be preferred for public route publishing.
+Full upstream Dokploy API access is also available through `raw_*` tools, for example `raw_project_all`, `raw_compose_update`, and `raw_application_deploy`. These are intended for administrator troubleshooting. Normal user workflows should prefer `dokploy_deploy_from_local_archive`, `dokploy_get_project_status`, `dokploy_delete_project`, and `dokploy_cleanup_failed_deploy`.
 
 For clients that cannot handle a very large tool list, set `DOKPLOY_ENABLED_TAGS` to a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
 
-The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish routes through `/join/routes`, and verify the final public URL returns 200.
+The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish/remove routes through `/join/routes`, and verify the final public URL state.
 
 ## Local Project Uploads
 
@@ -47,10 +51,25 @@ The machine running Codex/MCP must have `tar` available for directory uploads. O
 ```toml
 [mcp_servers.dokploy_safe.env]
 DOKPLOY_UPLOAD_URL = "http://183.196.108.32:18080/join/deployments"
+DOKPLOY_UPLOAD_STATUS_URL = "http://183.196.108.32:18080/join/deployments"
+DOKPLOY_ROUTES_URL = "http://183.196.108.32:18080/join/routes"
 DOKPLOY_UPLOAD_MAX_MB = "500"
+DOKPLOY_COMPOSE_ROOT = "/etc/dokploy/compose"
 ```
 
 If these are omitted, the MCP defaults to `${DOKPLOY_PUBLIC_HTTP_URL}/join/deployments` and a 500MB upload limit. SSH/SCP is no longer required for normal users.
+
+When testing on the Dokploy host itself, operators can point `DOKPLOY_URL`, `DOKPLOY_UPLOAD_URL`, `DOKPLOY_UPLOAD_STATUS_URL`, and `DOKPLOY_ROUTES_URL` at local Traefik (`http://127.0.0.1`) while keeping `DOKPLOY_PUBLIC_HTTP_URL` public for final route verification.
+
+## Project Deletion and Cleanup
+
+Use the high-level tools before raw API calls:
+
+- `dokploy_get_project_status`: inspect one project, related compose apps, deployments, managed routes, and route checks.
+- `dokploy_delete_project`: delete one visible project by exact ID or unique name, remove its managed routes, and clean up leftover containers.
+- `dokploy_cleanup_failed_deploy`: clean up failed or partial deployments by project, compose, or route path.
+
+Project names must resolve to exactly one visible project. If a name matches multiple projects, use the project ID.
 
 ## Recommended Codex Config
 
@@ -91,7 +110,14 @@ Add this MCP to Codex config:
 - DOKPLOY_PUBLIC_HTTP_URL: http://183.196.108.32:18080
 - DOKPLOY_API_KEY: use the key above
 
-After configuration, remind me to fully restart Codex. After restart, check Dokploy connectivity and list projects, applications, compose, and dokploy_safe tools.
+After configuration, remind me to fully restart Codex.
+
+After restart:
+- Check Dokploy connectivity with dokploy_connection_check.
+- For deployments, use dokploy_deploy_from_local_archive first.
+- For status checks, use dokploy_get_project_status.
+- For deletion or cleanup, use dokploy_delete_project or dokploy_cleanup_failed_deploy.
+- Use raw_* tools only for administrator troubleshooting.
 ```
 
 ## Local Install

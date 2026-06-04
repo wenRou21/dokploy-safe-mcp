@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "node:child_process";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,7 +18,10 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.DOKPLOY_SAFE_TIMEOUT_MS || 180000)
 const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const RAW_TOOL_PREFIX = "raw_";
 const UPLOAD_URL = process.env.DOKPLOY_UPLOAD_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
+const UPLOAD_STATUS_URL = process.env.DOKPLOY_UPLOAD_STATUS_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_MAX_BYTES = Number(process.env.DOKPLOY_UPLOAD_MAX_MB || 500) * 1024 * 1024;
+const ROUTES_URL = process.env.DOKPLOY_ROUTES_URL || `${DOKPLOY_URL}/join/routes`;
+const COMPOSE_ROOT = process.env.DOKPLOY_COMPOSE_ROOT || "/etc/dokploy/compose";
 
 const RESERVED_PATHS = new Set([
 	"api",
@@ -48,21 +52,25 @@ const server = new McpServer({
 server.tool(
 	"dokploy_platform_rules",
 	[
-		"Return the required deployment rules for this Dokploy host.",
-		"Call this before using raw dokploy MCP tools for deployment-related work.",
-		"For deployment and route publishing, prefer dokploy_deploy_static_page or dokploy_publish_route.",
+			"Return the required deployment rules for this Dokploy host.",
+			"For normal deployment, route publishing, status, cleanup, and deletion, prefer the high-level dokploy_* workflow tools.",
+			"Use raw dokploy MCP tools only for advanced administrator troubleshooting.",
 	].join(" "),
 	{},
 	async () => jsonToolResult({
 		ok: true,
 		message: "Use dokploy_safe as the preferred entry point for deployment and route publishing.",
 		preferredTools: [
+			"dokploy_deploy_from_local_archive",
 			"dokploy_deploy_static_page",
 			"dokploy_publish_route",
+			"dokploy_unpublish_route",
+			"dokploy_get_project_status",
+			"dokploy_delete_project",
+			"dokploy_cleanup_failed_deploy",
 		],
 		rawDokployUseCases: [
-			"Use built-in dokploy_* tools in this MCP for common listing, detail, logs, status, and deploy operations.",
-			"Use raw_* tools in this MCP for advanced upstream Dokploy API operations not wrapped by safe tools.",
+			"Use raw_* tools only for advanced upstream Dokploy API operations not wrapped by safe tools.",
 		],
 		rules: platformRules(),
 	}),
@@ -334,6 +342,61 @@ server.tool(
 );
 
 server.tool(
+	"dokploy_unpublish_route",
+	[
+		"Remove a public path route that was created through /join/routes.",
+		"This tool calls DELETE /join/routes through the route manager and verifies the public path no longer returns 200.",
+	].join(" "),
+	{
+		path: z.string().describe("External path prefix to remove, for example /my-site."),
+		verifyTimeoutMs: z.number().int().positive().optional().describe("Public URL removal verification timeout in milliseconds."),
+	},
+	async (input) => jsonToolResult(await unpublishRouteAndVerify(input)),
+);
+
+server.tool(
+	"dokploy_get_project_status",
+	"Resolve one visible project and return its environments, compose apps, deployments, managed routes, and public route checks.",
+	{
+		projectIdOrName: z.string().describe("Project ID or exact/unique project name."),
+		verifyRoutes: z.boolean().default(true).describe("Whether to check each managed route over public HTTP."),
+	},
+	async (input) => jsonToolResult(await getProjectStatus(input.projectIdOrName, { verifyRoutes: input.verifyRoutes })),
+);
+
+server.tool(
+	"dokploy_delete_project",
+	[
+		"Delete one visible Dokploy project by exact ID or unique name, plus its managed public routes.",
+		"The target must resolve to exactly one project. If cleanupContainers is true, this also removes leftover containers for the project's compose apps after project.remove.",
+	].join(" "),
+	{
+		projectIdOrName: z.string().describe("Project ID or exact/unique project name."),
+		deleteRoutes: z.boolean().default(true).describe("Remove /join/routes managed public routes before deleting."),
+		cleanupContainers: z.boolean().default(true).describe("Try to stop/remove leftover Docker containers for project compose app names."),
+		verifyTimeoutMs: z.number().int().positive().optional().describe("Route deletion verification timeout in milliseconds."),
+	},
+	async (input) => jsonToolResult(await deleteProject(input)),
+);
+
+server.tool(
+	"dokploy_cleanup_failed_deploy",
+	[
+		"Clean up a failed or partial deployment by project, compose, or route path.",
+		"Use this when upload/deploy/publish partially succeeded and left a project, route, or container behind.",
+	].join(" "),
+	{
+		projectIdOrName: z.string().optional().describe("Project ID or exact/unique project name."),
+		composeId: z.string().optional().describe("Compose ID belonging to the failed deployment."),
+		path: z.string().optional().describe("Managed public route path, for example /my-site."),
+		deleteRoutes: z.boolean().default(true),
+		cleanupContainers: z.boolean().default(true),
+		verifyTimeoutMs: z.number().int().positive().optional(),
+	},
+	async (input) => jsonToolResult(await cleanupFailedDeploy(input)),
+);
+
+server.tool(
 	"dokploy_prepare_upload_slot",
 	[
 		"Return the HTTP upload endpoint used for large local project deployments.",
@@ -531,25 +594,14 @@ async function deployFromLocalArchive(input) {
 }
 
 async function uploadAndDeploy(input) {
-	const form = new FormData();
-	form.set("apiKey", API_KEY);
-	form.set("name", input.name);
-	form.set("mode", input.mode);
-	form.set("port", String(input.port));
-	if (input.path) {
-		form.set("path", input.path);
-	}
-	for (const [key, value] of Object.entries(input.env || {})) {
-		form.set(`env_${key}`, String(value));
-	}
-
 	const filename = path.basename(input.localPayload.path);
-	const archive = await fs.openAsBlob(input.localPayload.path, { type: archiveContentType(filename) });
-	form.set("archive", archive, filename);
+	const form = await uploadForm(input, filename);
 	const response = await fetch(UPLOAD_URL, {
 		method: "POST",
-		body: form,
-		signal: AbortSignal.timeout(120000),
+		headers: form.headers || undefined,
+		body: form.body,
+		...(form.duplex ? { duplex: form.duplex } : {}),
+		signal: AbortSignal.timeout(300000),
 	});
 	const text = await response.text();
 	const data = parseJsonText(text);
@@ -571,35 +623,50 @@ async function uploadAndDeploy(input) {
 async function waitForUploadDeploymentTask(initial, timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	let last = initial;
-	const statusUrl = initial.statusUrl || `${PUBLIC_HTTP_URL}/join/deployments/${encodeURIComponent(initial.taskId)}`;
+	const statusUrl = `${UPLOAD_STATUS_URL}/${encodeURIComponent(initial.taskId)}`;
 
 	while (Date.now() < deadline) {
 		const url = new URL(statusUrl);
 		url.searchParams.set("apiKey", API_KEY);
-		const response = await fetch(url, {
-			method: "GET",
-			headers: { Accept: "application/json" },
-			signal: AbortSignal.timeout(30000),
-		});
-		const text = await response.text();
-		const data = parseJsonText(text);
-		if (!response.ok) {
-			const message = typeof data === "object" && data
-				? data.message || data.error || JSON.stringify(data)
-				: text;
-			throw new Error(`Upload deployment status failed: HTTP ${response.status} ${response.statusText}: ${message}`);
-		}
-		last = data;
-		if (data?.status === "done" && data.result) {
-			return {
-				...data.result,
-				taskId: data.taskId || initial.taskId,
-				taskStatus: data.status,
-				taskMessage: data.message,
-			};
-		}
-		if (data?.status === "error") {
-			throw new Error(`Upload deployment failed: ${data.message || JSON.stringify(data)}`);
+		try {
+			const response = await fetch(url, {
+				method: "GET",
+				headers: { Accept: "application/json" },
+				signal: AbortSignal.timeout(30000),
+			});
+			const text = await response.text();
+			const data = parseJsonText(text);
+			if (!response.ok) {
+				const message = typeof data === "object" && data
+					? data.message || data.error || JSON.stringify(data)
+					: text;
+				throw new Error(`Upload deployment status failed: HTTP ${response.status} ${response.statusText}: ${message}`);
+			}
+			last = data;
+			if (data?.status === "done" && data.result) {
+				return {
+					...data.result,
+					taskId: data.taskId || initial.taskId,
+					taskStatus: data.status,
+					taskMessage: data.message,
+				};
+			}
+			if (data?.ok === true && data.result) {
+				return {
+					...data.result,
+					taskId: data.taskId || initial.taskId,
+					taskStatus: data.status,
+					taskMessage: data.message,
+				};
+			}
+			if (data?.status === "error") {
+				throw new Error(`Upload deployment failed: ${data.message || JSON.stringify(data)}`);
+			}
+		} catch (error) {
+			if (!isNetworkError(error)) {
+				throw error;
+			}
+			last = { statusPollError: error.message };
 		}
 		await delay(3000);
 	}
@@ -714,12 +781,209 @@ async function publishRouteAndVerify(input) {
 }
 
 async function publishRoute(body) {
-	return httpJson(`${DOKPLOY_URL}/join/routes`, {
+	return httpJson(ROUTES_URL, {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Accept: "application/json" },
 		body: JSON.stringify(body),
 		timeoutMs: 60000,
 	});
+}
+
+async function unpublishRouteAndVerify(input) {
+	assertConfigured();
+	const path = normalizePath(input.path);
+	validatePath(path);
+	const result = await deleteRoute({ apiKey: API_KEY, path });
+	const url = result.url || `${PUBLIC_HTTP_URL}${path}`;
+	const verification = await waitForPublicUrlNotOk(url, input.verifyTimeoutMs || 60000);
+	return {
+		ok: true,
+		message: "Route removed through /join/routes and public URL no longer returns 200.",
+		path,
+		url,
+		route: result,
+		verification,
+	};
+}
+
+async function deleteRoute(body) {
+	return httpJson(ROUTES_URL, {
+		method: "DELETE",
+		headers: { "Content-Type": "application/json", Accept: "application/json" },
+		body: JSON.stringify(body),
+		timeoutMs: 60000,
+	});
+}
+
+async function getProjectStatus(projectIdOrName, options = {}) {
+	assertConfigured();
+	const project = await resolveProject(projectIdOrName);
+	const projectId = project.projectId || project.id;
+	const environments = rowsOf(await tryDokploy("GET", "/environment.byProjectId", { projectId }));
+	const compose = await searchComposes({ projectId });
+	const applications = await searchApplications({ projectId });
+	const deployments = [];
+	for (const item of compose) {
+		const composeId = item.composeId || item.id;
+		if (!composeId) continue;
+		deployments.push({
+			composeId,
+			appName: item.appName || item.name,
+			latest: latestDeployment(await tryDokploy("GET", "/deployment.allByCompose", { composeId })),
+		});
+	}
+	const routes = await managedRoutesForTargets({
+		composeIds: compose.map((item) => item.composeId || item.id).filter(Boolean),
+		applicationIds: applications.map((item) => item.applicationId || item.id).filter(Boolean),
+	});
+	const routeChecks = [];
+	if (options.verifyRoutes !== false) {
+		for (const route of routes) {
+			routeChecks.push({
+				path: route.path,
+				url: `${PUBLIC_HTTP_URL}${route.path}`,
+				check: await quickPublicUrlCheck(`${PUBLIC_HTTP_URL}${route.path}`),
+			});
+		}
+	}
+	return {
+		ok: true,
+		project,
+		environments,
+		compose,
+		applications,
+		deployments,
+		routes,
+		routeChecks,
+	};
+}
+
+async function deleteProject(input) {
+	assertConfigured();
+	const startedAt = new Date().toISOString();
+	const before = await getProjectStatus(input.projectIdOrName, { verifyRoutes: false });
+	const projectId = before.project.projectId || before.project.id;
+	const steps = [];
+
+	if (input.deleteRoutes !== false) {
+		for (const route of before.routes) {
+			try {
+				const removed = await unpublishRouteAndVerify({
+					path: route.path,
+					verifyTimeoutMs: input.verifyTimeoutMs || 60000,
+				});
+				steps.push({ step: "unpublish_route", path: route.path, ok: true, result: removed });
+			} catch (error) {
+				steps.push({ step: "unpublish_route", path: route.path, ok: false, error: error.message });
+			}
+		}
+	}
+
+	try {
+		const removed = await dokploy("POST", "/project.remove", { projectId });
+		steps.push({ step: "project_remove", projectId, ok: true, result: removed });
+	} catch (error) {
+		steps.push({ step: "project_remove", projectId, ok: false, error: error.message });
+		throw new Error(`Project removal failed for ${projectId}: ${error.message}`);
+	}
+
+	if (input.cleanupContainers !== false) {
+		for (const appName of composeAppNames(before.compose)) {
+			const cleanup = await cleanupContainersByAppName(appName);
+			steps.push({ step: "cleanup_containers", appName, ...cleanup });
+			const composeDirCleanup = await cleanupComposeDirectory(appName);
+			steps.push({ step: "cleanup_compose_directory", appName, ...composeDirCleanup });
+		}
+	}
+
+	const projectCheck = await tryDokploy("GET", "/project.one", { projectId });
+	const remainingRoutes = await managedRoutesForTargets({
+		composeIds: before.compose.map((item) => item.composeId || item.id).filter(Boolean),
+		applicationIds: before.applications.map((item) => item.applicationId || item.id).filter(Boolean),
+	});
+
+	return {
+		ok: !projectCheck && remainingRoutes.length === 0,
+		message: "Project delete workflow completed.",
+		projectId,
+		projectName: before.project.name,
+		startedAt,
+		completedAt: new Date().toISOString(),
+		before,
+		steps,
+		verification: {
+			projectGone: !projectCheck,
+			remainingRoutes,
+		},
+	};
+}
+
+async function cleanupFailedDeploy(input) {
+	assertConfigured();
+	if (!input.projectIdOrName && !input.composeId && !input.path) {
+		throw new Error("Provide projectIdOrName, composeId, or path.");
+	}
+
+	let projectIdOrName = input.projectIdOrName;
+	if (!projectIdOrName && input.composeId) {
+		const compose = await dokploy("GET", "/compose.one", { composeId: input.composeId });
+		projectIdOrName = compose.projectId || compose.project?.projectId || compose.project?.id;
+		if (!projectIdOrName) {
+			projectIdOrName = await projectIdForEnvironment(compose.environmentId);
+		}
+	}
+	if (!projectIdOrName && input.path) {
+		const path = normalizePath(input.path);
+		const route = (await managedRoutesForTargets({ paths: [path] }))[0];
+		if (route?.ownerId) {
+				const compose = await tryDokploy("GET", "/compose.one", { composeId: route.ownerId });
+				projectIdOrName = compose?.projectId || compose?.project?.projectId || compose?.project?.id;
+				if (!projectIdOrName && compose?.environmentId) {
+					projectIdOrName = await projectIdForEnvironment(compose.environmentId);
+				}
+				if (!projectIdOrName) {
+					const app = await tryDokploy("GET", "/application.one", { applicationId: route.ownerId });
+					projectIdOrName = app?.projectId || app?.project?.projectId || app?.project?.id;
+					if (!projectIdOrName && app?.environmentId) {
+						projectIdOrName = await projectIdForEnvironment(app.environmentId);
+					}
+				}
+			}
+		}
+
+	const routeOnlySteps = [];
+	if (input.path) {
+		try {
+			const removed = await unpublishRouteAndVerify({
+				path: input.path,
+				verifyTimeoutMs: input.verifyTimeoutMs || 60000,
+			});
+			routeOnlySteps.push({ step: "unpublish_route", path: normalizePath(input.path), ok: true, result: removed });
+		} catch (error) {
+			routeOnlySteps.push({ step: "unpublish_route", path: normalizePath(input.path), ok: false, error: error.message });
+		}
+	}
+
+	if (!projectIdOrName) {
+		return {
+			ok: routeOnlySteps.every((step) => step.ok),
+			message: "Only route cleanup was possible; no project could be resolved from the provided input.",
+			steps: routeOnlySteps,
+		};
+	}
+
+	const deleted = await deleteProject({
+		projectIdOrName,
+		deleteRoutes: input.deleteRoutes !== false,
+		cleanupContainers: input.cleanupContainers !== false,
+		verifyTimeoutMs: input.verifyTimeoutMs,
+	});
+	return {
+		ok: deleted.ok && routeOnlySteps.every((step) => step.ok),
+		message: "Failed deployment cleanup completed.",
+		preSteps: routeOnlySteps,
+		deleteProject: deleted,
+	};
 }
 
 function isRouteAlreadyOwnedError(error) {
@@ -803,6 +1067,45 @@ async function waitForPublicUrl(url, timeoutMs) {
 	throw new Error(`Public URL verification failed for ${url}. Last result: ${JSON.stringify(last)}`);
 }
 
+async function waitForPublicUrlNotOk(url, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	let last = null;
+
+	while (Date.now() < deadline) {
+		try {
+			const response = await fetch(url, {
+				method: "GET",
+				headers: { Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8" },
+				redirect: "manual",
+				signal: AbortSignal.timeout(10000),
+			});
+			const text = await response.text();
+			last = {
+				status: response.status,
+				contentType: response.headers.get("content-type"),
+				snippet: text.replace(/\s+/g, " ").slice(0, 240),
+			};
+			if (response.status !== 200) {
+				return {
+					ok: true,
+					status: response.status,
+					contentType: last.contentType,
+					snippet: last.snippet,
+				};
+			}
+		} catch (error) {
+			return {
+				ok: true,
+				error: error.message,
+			};
+		}
+
+		await delay(3000);
+	}
+
+	throw new Error(`Public URL still returned 200 for ${url}. Last result: ${JSON.stringify(last)}`);
+}
+
 async function dokploy(method, path, data) {
 	const url = new URL(`${DOKPLOY_URL}/api${path}`);
 	const init = {
@@ -825,7 +1128,308 @@ async function dokploy(method, path, data) {
 		init.body = JSON.stringify(data || {});
 	}
 
-	return httpJson(url, init);
+	return httpJsonWithRetry(url, init);
+}
+
+async function httpJsonWithRetry(url, init, attempts = 3) {
+	let lastError;
+	for (let attempt = 1; attempt <= attempts; attempt++) {
+		try {
+			return await httpJson(url, init);
+		} catch (error) {
+			lastError = error;
+			if (!isNetworkError(error) || attempt === attempts) {
+				throw error;
+			}
+			await delay(500 * attempt);
+		}
+	}
+	throw lastError;
+}
+
+function isNetworkError(error) {
+	const message = error?.message || "";
+	return message === "fetch failed"
+		|| message.includes("The operation was aborted")
+		|| message.includes("ECONNRESET")
+		|| message.includes("UND_ERR");
+}
+
+async function resolveProject(projectIdOrName) {
+	const needle = String(projectIdOrName || "").trim();
+	if (!needle) throw new Error("projectIdOrName is required.");
+
+	const direct = await tryDokploy("GET", "/project.one", { projectId: needle });
+	if (direct) return direct;
+
+	const projects = rowsOf(await dokploy("GET", "/project.all"));
+	const matches = projects.filter((project) => {
+		const values = [
+			project.projectId,
+			project.id,
+			project.name,
+			project.appName,
+			project.slug,
+		].filter(Boolean).map(String);
+		return values.includes(needle);
+	});
+
+	if (matches.length === 1) return matches[0];
+	if (matches.length > 1) {
+		throw new Error(`Project name matched multiple projects; use projectId. Candidates: ${JSON.stringify(matches.map(projectSummary))}`);
+	}
+
+	throw new Error(`No visible project matched ${needle}`);
+}
+
+async function searchComposes(filter = {}) {
+	return rowsOf(await tryDokploy("GET", "/compose.search", {
+		limit: 100,
+		offset: 0,
+		...filter,
+	}));
+}
+
+async function searchApplications(filter = {}) {
+	return rowsOf(await tryDokploy("GET", "/application.search", {
+		limit: 100,
+		offset: 0,
+		...filter,
+	}));
+}
+
+async function projectIdForEnvironment(environmentId) {
+	if (!environmentId) return null;
+	for (const project of rowsOf(await dokploy("GET", "/project.all"))) {
+		const projectId = project.projectId || project.id;
+		if (!projectId) continue;
+		const environments = rowsOf(await tryDokploy("GET", "/environment.byProjectId", { projectId }));
+		if (environments.some((env) => (env.environmentId || env.id) === environmentId)) {
+			return projectId;
+		}
+	}
+	return null;
+}
+
+function rowsOf(value) {
+	if (Array.isArray(value)) return value.filter(isObject);
+	if (!isObject(value)) return [];
+	for (const key of ["data", "rows", "items", "projects", "applications", "compose", "composes", "deployments"]) {
+		if (Array.isArray(value[key])) return value[key].filter(isObject);
+	}
+	return [];
+}
+
+function isObject(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function projectSummary(project) {
+	return {
+		projectId: project.projectId || project.id,
+		name: project.name,
+	};
+}
+
+function composeAppNames(compose) {
+	return [...new Set(compose.map((item) => item.appName || item.name).filter(Boolean).map(String))];
+}
+
+async function managedRoutesForTargets({ composeIds = [], applicationIds = [], paths = [] }) {
+	const targetIds = new Set([...composeIds, ...applicationIds].filter(Boolean).map(String));
+	const targetPaths = new Set(paths.map((item) => normalizePath(item)));
+	const routes = parseManagedRoutes(await readTraefikConfig());
+	return routes.filter((route) => {
+		if (targetPaths.size && targetPaths.has(route.path)) return true;
+		if (targetIds.size && targetIds.has(route.ownerId)) return true;
+		return false;
+	});
+}
+
+async function readTraefikConfig() {
+	const queryPath = `/settings.readTraefikFile?path=${encodeURIComponent("/etc/dokploy/traefik/dynamic/manual-ai-platform.yml")}`;
+	const data = await tryDokploy("GET", queryPath, {});
+	if (typeof data === "string") return data;
+	if (isObject(data)) return data.content || data.data || data.traefikConfig || "";
+	return "";
+}
+
+function parseManagedRoutes(config) {
+	const text = String(config || "");
+	const routes = [];
+	const metaRe = /^# route-manager owner=([^ ]*) path=(\/[^ ]+) kind=([A-Za-z0-9_-]+)/gm;
+	let match;
+	while ((match = metaRe.exec(text))) {
+		routes.push({
+			ownerId: match[1],
+			path: match[2],
+			kind: match[3],
+		});
+	}
+
+	const prefixRe = /PathPrefix\(`(\/[^`]+)`\)/g;
+	while ((match = prefixRe.exec(text))) {
+		if (!routes.some((route) => route.path === match[1])) {
+			routes.push({ ownerId: "", path: match[1], kind: "unknown" });
+		}
+	}
+	return routes;
+}
+
+async function quickPublicUrlCheck(url) {
+	try {
+		const response = await fetch(url, {
+			method: "GET",
+			redirect: "manual",
+			signal: AbortSignal.timeout(10000),
+		});
+		const text = await response.text();
+		return {
+			ok: response.status === 200,
+			status: response.status,
+			contentType: response.headers.get("content-type"),
+			snippet: text.replace(/\s+/g, " ").slice(0, 160),
+		};
+	} catch (error) {
+		return { ok: false, error: error.message };
+	}
+}
+
+async function cleanupContainersByAppName(appName) {
+	const containers = rowsOf(await tryDokploy("GET", "/docker.getContainersByAppNameMatch", { appName }));
+	const matched = containers.filter((container) => {
+		const values = [
+			container.name,
+			container.containerName,
+			container.Names?.join?.(" "),
+			container.appName,
+		].filter(Boolean).join(" ");
+		return values.includes(appName);
+	});
+	const steps = [];
+	for (const container of matched) {
+		const containerId = container.containerId || container.id || container.Id;
+		if (!containerId) continue;
+		try {
+			await dokploy("POST", "/docker.stopContainer", { containerId });
+			steps.push({ action: "stop", containerId, ok: true });
+		} catch (error) {
+			steps.push({ action: "stop", containerId, ok: false, error: error.message });
+		}
+		try {
+			await dokploy("POST", "/docker.removeContainer", { containerId });
+			steps.push({ action: "remove", containerId, ok: true });
+		} catch (error) {
+			steps.push({ action: "remove", containerId, ok: false, error: error.message });
+		}
+	}
+	return {
+		ok: steps.every((step) => step.ok),
+		matched: matched.length,
+		steps,
+	};
+}
+
+async function cleanupComposeDirectory(appName) {
+	const safeName = String(appName || "");
+	if (!/^[A-Za-z0-9._-]+$/.test(safeName)) {
+		return { ok: false, skipped: true, reason: "appName is not a safe compose directory name" };
+	}
+	const root = path.resolve(COMPOSE_ROOT);
+	const target = path.resolve(root, safeName);
+	if (!target.startsWith(`${root}${path.sep}`)) {
+		return { ok: false, skipped: true, reason: "resolved compose directory is outside compose root" };
+	}
+	try {
+		await fs.rm(target, { recursive: true, force: true });
+		return { ok: true, path: target };
+	} catch (error) {
+		return { ok: false, path: target, error: error.message };
+	}
+}
+
+async function multipartBody(fields, file) {
+	const boundary = `----dokploy-safe-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	const chunks = [];
+	let contentLength = 0;
+	for (const [key, value] of Object.entries(fields)) {
+		const chunk = Buffer.from([
+			`--${boundary}`,
+			`Content-Disposition: form-data; name="${escapeMultipartName(key)}"`,
+			"",
+			String(value),
+			"",
+		].join("\r\n"));
+		contentLength += chunk.length;
+		chunks.push(chunk);
+	}
+	const fileHeader = Buffer.from([
+		`--${boundary}`,
+		`Content-Disposition: form-data; name="${escapeMultipartName(file.fieldName)}"; filename="${escapeMultipartName(file.filename)}"`,
+		`Content-Type: ${file.contentType}`,
+	].join("\r\n") + "\r\n\r\n");
+	const fileStat = await fs.stat(file.filePath);
+	const fileFooter = Buffer.from(`\r\n--${boundary}--\r\n`);
+	contentLength += fileHeader.length + fileStat.size + fileFooter.length;
+	chunks.push(fileHeader);
+	chunks.push(createReadStream(file.filePath));
+	chunks.push(fileFooter);
+
+	return {
+		headers: {
+			"Content-Type": `multipart/form-data; boundary=${boundary}`,
+			"Content-Length": String(contentLength),
+		},
+		body: ReadableStreamFrom(chunks),
+	};
+}
+
+async function uploadForm(input, filename) {
+	const fields = {
+		apiKey: API_KEY,
+		name: input.name,
+		mode: input.mode,
+		port: String(input.port),
+	};
+	if (input.path) fields.path = input.path;
+	for (const [key, value] of Object.entries(input.env || {})) {
+		fields[`env_${key}`] = String(value);
+	}
+
+	return {
+		...(await multipartBody(fields, {
+			fieldName: "archive",
+			filePath: input.localPayload.path,
+			filename,
+			contentType: archiveContentType(filename),
+		})),
+		duplex: "half",
+	};
+}
+
+function ReadableStreamFrom(chunks) {
+	return new ReadableStream({
+		async start(controller) {
+			try {
+				for (const chunk of chunks) {
+					if (Buffer.isBuffer(chunk)) {
+						controller.enqueue(chunk);
+						continue;
+					}
+					for await (const part of chunk) {
+						controller.enqueue(part);
+					}
+				}
+				controller.close();
+			} catch (error) {
+				controller.error(error);
+			}
+		},
+	});
+}
+
+function escapeMultipartName(value) {
+	return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r|\n/g, "_");
 }
 
 function registerUpstreamDokployTools(mcpServer) {
