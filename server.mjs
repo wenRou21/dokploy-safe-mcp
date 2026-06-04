@@ -543,9 +543,9 @@ async function uploadAndDeploy(input) {
 		form.set(`env_${key}`, String(value));
 	}
 
-	const bytes = await fs.readFile(input.localPayload.path);
 	const filename = path.basename(input.localPayload.path);
-	form.set("archive", new Blob([bytes], { type: archiveContentType(filename) }), filename);
+	const archive = await fs.openAsBlob(input.localPayload.path, { type: archiveContentType(filename) });
+	form.set("archive", archive, filename);
 	const response = await fetch(UPLOAD_URL, {
 		method: "POST",
 		body: form,
