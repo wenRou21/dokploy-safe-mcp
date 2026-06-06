@@ -17,11 +17,23 @@ const API_KEY = process.env.DOKPLOY_API_KEY;
 const DEFAULT_TIMEOUT_MS = Number(process.env.DOKPLOY_SAFE_TIMEOUT_MS || 180000);
 const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const RAW_TOOL_PREFIX = "raw_";
+const MCP_NAME = "dokploy-safe-mcp";
+const MCP_VERSION = "1.0.0";
 const UPLOAD_URL = process.env.DOKPLOY_UPLOAD_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_STATUS_URL = process.env.DOKPLOY_UPLOAD_STATUS_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_MAX_BYTES = Number(process.env.DOKPLOY_UPLOAD_MAX_MB || 500) * 1024 * 1024;
 const ROUTES_URL = process.env.DOKPLOY_ROUTES_URL || `${DOKPLOY_URL}/join/routes`;
 const COMPOSE_ROOT = process.env.DOKPLOY_COMPOSE_ROOT || "/etc/dokploy/compose";
+const USAGE_ENABLED = !falseyEnv(process.env.DOKPLOY_SAFE_USAGE_LOG);
+const USAGE_LOG_PATH = process.env.DOKPLOY_SAFE_USAGE_LOG_PATH || path.join(os.homedir(), ".codex", "dokploy-safe-mcp-usage.jsonl");
+const DEFAULT_USAGE_ENDPOINT = "http://183.196.108.32:18080/mcp-usage/events";
+const DEFAULT_USAGE_TOKEN = "7e48f8f9e8e6402ca73f861c9f84bff2.dokploy-safe-mcp.usage";
+const USAGE_ENDPOINT = trimTrailingSlash(process.env.DOKPLOY_SAFE_USAGE_ENDPOINT || DEFAULT_USAGE_ENDPOINT);
+const USAGE_TOKEN = process.env.DOKPLOY_SAFE_USAGE_TOKEN || DEFAULT_USAGE_TOKEN;
+const USAGE_NODE_ID = process.env.DOKPLOY_SAFE_USAGE_NODE_ID || defaultUsageNodeId();
+const USAGE_REMOTE_ENABLED = truthyEnv(process.env.DOKPLOY_SAFE_USAGE_REMOTE ?? "1")
+	&& Boolean(USAGE_ENDPOINT)
+	&& Boolean(USAGE_TOKEN);
 
 const RESERVED_PATHS = new Set([
 	"api",
@@ -35,8 +47,8 @@ const RESERVED_PATHS = new Set([
 ]);
 
 const server = new McpServer({
-	name: "dokploy-safe-mcp",
-	version: "1.0.0",
+	name: MCP_NAME,
+	version: MCP_VERSION,
 }, {
 	instructions: [
 		"This server is the single preferred MCP entry point for Dokploy on this host.",
@@ -48,6 +60,8 @@ const server = new McpServer({
 		"New public deployments must use a unique path prefix and verify the final public URL returns 200.",
 	].join(" "),
 });
+
+instrumentToolUsage(server);
 
 server.tool(
 	"dokploy_platform_rules",
@@ -1461,6 +1475,95 @@ function registerUpstreamDokployTools(mcpServer) {
 	});
 }
 
+function instrumentToolUsage(mcpServer) {
+	const originalTool = mcpServer.tool.bind(mcpServer);
+	mcpServer.tool = (...args) => {
+		const name = String(args[0] || "unknown");
+		const handlerIndex = findLastFunctionIndex(args);
+		if (handlerIndex !== -1) {
+			const handler = args[handlerIndex];
+			args[handlerIndex] = async (...handlerArgs) => {
+				const startedAt = new Date();
+				const started = Date.now();
+				try {
+					const result = await handler(...handlerArgs);
+					recordUsage({
+						timestamp: startedAt.toISOString(),
+						toolName: name,
+						ok: true,
+						durationMs: Date.now() - started,
+					});
+					return result;
+				} catch (error) {
+					recordUsage({
+						timestamp: startedAt.toISOString(),
+						toolName: name,
+						ok: false,
+						durationMs: Date.now() - started,
+					});
+					throw error;
+				}
+			};
+		}
+		return originalTool(...args);
+	};
+}
+
+function findLastFunctionIndex(values) {
+	for (let index = values.length - 1; index >= 0; index--) {
+		if (typeof values[index] === "function") return index;
+	}
+	return -1;
+}
+
+function recordUsage(entry) {
+	if (!USAGE_ENABLED) return;
+	const usageEvent = {
+		timestamp: entry.timestamp,
+		toolName: entry.toolName,
+		nodeId: USAGE_NODE_ID,
+		ok: entry.ok,
+		durationMs: entry.durationMs,
+		mcpName: MCP_NAME,
+		mcpVersion: MCP_VERSION,
+	};
+	void persistUsage(usageEvent);
+}
+
+async function persistUsage(entry) {
+	await Promise.allSettled([
+		writeUsageLog(entry),
+		reportUsage(entry),
+	]);
+}
+
+async function writeUsageLog(entry) {
+	try {
+		await fs.mkdir(path.dirname(USAGE_LOG_PATH), { recursive: true });
+		await fs.appendFile(USAGE_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+	} catch (error) {
+		console.error(`[dokploy-safe-mcp] Failed to write usage log: ${error.message}`);
+	}
+}
+
+async function reportUsage(entry) {
+	if (!USAGE_REMOTE_ENABLED) return;
+	try {
+		await fetch(USAGE_ENDPOINT, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${USAGE_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(entry),
+			signal: AbortSignal.timeout(2000),
+		});
+	} catch {
+		// Usage reporting must never affect MCP tool execution.
+	}
+}
+
 function getEnabledUpstreamTools() {
 	const enabledTags = process.env.DOKPLOY_ENABLED_TAGS;
 	if (!enabledTags) {
@@ -1667,6 +1770,22 @@ function timestampSlug() {
 
 function trimTrailingSlash(value) {
 	return value.replace(/\/+$/, "");
+}
+
+function truthyEnv(value) {
+	return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+function falseyEnv(value) {
+	return ["0", "false", "no", "off"].includes(String(value || "").trim().toLowerCase());
+}
+
+function defaultUsageNodeId() {
+	try {
+		return `${os.hostname()}-${os.userInfo().username}`;
+	} catch {
+		return os.hostname();
+	}
 }
 
 function escapeHtml(value) {

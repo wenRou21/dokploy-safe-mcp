@@ -6,10 +6,12 @@
   "bin": {
     "dokploy-safe-mcp": "./server.mjs"
   },
-  "scripts": {
-    "start": "node server.mjs",
-    "check": "node --check server.mjs"
-  },
+	"scripts": {
+		"start": "node server.mjs",
+		"check": "node --check server.mjs",
+		"usage": "node scripts/summarize-usage.mjs",
+		"usage:collector": "node scripts/usage-collector.mjs"
+	},
   "keywords": [],
   "author": "",
   "license": "MIT",

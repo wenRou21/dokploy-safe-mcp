@@ -71,6 +71,58 @@ Use the high-level tools before raw API calls:
 
 Project names must resolve to exactly one visible project. If a name matches multiple projects, use the project ID.
 
+## Tool Usage Statistics
+
+Tool usage statistics are enabled by default. Every MCP tool call is recorded, including all safe `dokploy_*` tools and all upstream `raw_*` tools.
+
+The local fallback log defaults to:
+
+- Windows: `C:\Users\<you>\.codex\dokploy-safe-mcp-usage.jsonl`
+- Linux/macOS: `~/.codex/dokploy-safe-mcp-usage.jsonl`
+
+Each event records only `timestamp`, `toolName`, `nodeId`, `ok`, `durationMs`, `mcpName`, and `mcpVersion`. It does not record tool inputs, API keys, passwords, environment variables, upload contents, logs, or error messages.
+
+By default, the MCP also posts the same safe event shape to:
+
+```text
+http://183.196.108.32:18080/mcp-usage/events
+```
+
+Optional overrides:
+
+```toml
+[mcp_servers.dokploy_safe.env]
+DOKPLOY_SAFE_USAGE_LOG = "0" # disable local and remote usage statistics
+DOKPLOY_SAFE_USAGE_LOG_PATH = "C:\\Users\\Administrator\\.codex\\dokploy-safe-mcp-usage.jsonl"
+DOKPLOY_SAFE_USAGE_ENDPOINT = "http://183.196.108.32:18080/mcp-usage/events"
+DOKPLOY_SAFE_USAGE_TOKEN = "<collector token override>"
+DOKPLOY_SAFE_USAGE_NODE_ID = "office-pc-01"
+```
+
+To summarize a local or collected JSONL file with pagination:
+
+```powershell
+npm run usage -- --page 1 --pageSize 50
+npm run usage -- --log "C:\Users\Administrator\.codex\dokploy-safe-mcp-usage.jsonl" --page 2 --pageSize 50
+npm run usage -- --format json --page 1 --pageSize 100
+```
+
+The report includes every registered tool, including tools with `count = 0`. Rows include `toolName`, `type`, `count`, `successCount`, `errorCount`, `avgDurationMs`, and `lastUsedAt`. Tool types are `raw`, `safe/wrapper`, and `safe-critical`.
+
+To run the central collector on a host:
+
+```powershell
+$env:DOKPLOY_SAFE_USAGE_COLLECTOR_PORT = "18081"
+$env:DOKPLOY_SAFE_USAGE_COLLECTOR_LOG_PATH = "C:\Users\Administrator\.codex\dokploy-safe-mcp-usage-central.jsonl"
+npm run usage:collector
+```
+
+Collector endpoints:
+
+- `POST /mcp-usage/events`: accepts one event or `{ "events": [...] }`, with `Authorization: Bearer <token>`.
+- `GET /mcp-usage/summary?page=1&pageSize=50`: returns the paginated JSON summary.
+- `GET /mcp-usage/health`: returns collector health and log path.
+
 ## Recommended Codex Config
 
 Users do not need to download this folder manually. Add this single MCP server to Codex config and replace the API key:
