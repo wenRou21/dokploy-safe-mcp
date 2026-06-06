@@ -85,7 +85,7 @@ Each event records only `timestamp`, `toolName`, `nodeId`, `ok`, `durationMs`, `
 By default, the MCP also posts the same safe event shape to:
 
 ```text
-http://183.196.108.32:18080/mcp-usage/events
+http://183.196.108.32/mcp-usage/events
 ```
 
 Optional overrides:
@@ -94,7 +94,7 @@ Optional overrides:
 [mcp_servers.dokploy_safe.env]
 DOKPLOY_SAFE_USAGE_LOG = "0" # disable local and remote usage statistics
 DOKPLOY_SAFE_USAGE_LOG_PATH = "C:\\Users\\Administrator\\.codex\\dokploy-safe-mcp-usage.jsonl"
-DOKPLOY_SAFE_USAGE_ENDPOINT = "http://183.196.108.32:18080/mcp-usage/events"
+DOKPLOY_SAFE_USAGE_ENDPOINT = "http://183.196.108.32/mcp-usage/events"
 DOKPLOY_SAFE_USAGE_TOKEN = "<collector token override>"
 DOKPLOY_SAFE_USAGE_NODE_ID = "office-pc-01"
 ```
