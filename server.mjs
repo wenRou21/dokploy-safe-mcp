@@ -19,7 +19,7 @@ const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const RAW_TOOL_PREFIX = "raw_";
 const MCP_NAME = "dokploy-safe-mcp";
 const MCP_VERSION = "1.0.0";
-const RAW_MODE = String(process.env.DOKPLOY_SAFE_RAW_MODE || "minimal").trim().toLowerCase();
+const RAW_MODE = String(process.env.DOKPLOY_SAFE_RAW_MODE || "strict").trim().toLowerCase();
 const UPLOAD_URL = process.env.DOKPLOY_UPLOAD_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_STATUS_URL = process.env.DOKPLOY_UPLOAD_STATUS_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_MAX_BYTES = Number(process.env.DOKPLOY_UPLOAD_MAX_MB || 500) * 1024 * 1024;
@@ -37,6 +37,30 @@ const USAGE_REMOTE_ENABLED = truthyEnv(process.env.DOKPLOY_SAFE_USAGE_REMOTE ?? 
 	&& Boolean(USAGE_TOKEN);
 
 const RAW_MINIMAL_TOOL_NAMES = new Set([
+	"project_all",
+	"project_one",
+	"environment_byProjectId",
+	"compose_search",
+	"compose_one",
+	"compose_readLogs",
+	"compose_loadServices",
+	"application_search",
+	"application_one",
+	"application_readLogs",
+	"deployment_allByCompose",
+	"deployment_queueList",
+	"docker_getContainers",
+	"docker_getContainersByAppNameMatch",
+	"user_getPermissions",
+	"user_session",
+	"user_haveRootAccess",
+	"settings_health",
+	"settings_getTraefikPorts",
+	"settings_readTraefikFile",
+	"settings_readTraefikConfig",
+]);
+
+const RAW_MINIMAL_EXTRA_TOOL_NAMES = new Set([
 	"project_all",
 	"project_one",
 	"environment_byProjectId",
@@ -2091,7 +2115,7 @@ function getEnabledUpstreamTools() {
 		return [];
 	}
 
-	const mode = RAW_MODE === "minimal" ? "minimal" : "db";
+	const mode = ["strict", "minimal", "db"].includes(RAW_MODE) ? RAW_MODE : "strict";
 	return upstreamDokployTools.filter((tool) => isRawToolAllowed(tool, mode));
 }
 
@@ -2102,6 +2126,8 @@ function isRawToolAllowed(tool, mode) {
 	const method = tool.method.toUpperCase();
 
 	if (RAW_MINIMAL_TOOL_NAMES.has(normalizedName)) return true;
+	if (mode === "strict") return false;
+	if (RAW_MINIMAL_EXTRA_TOOL_NAMES.has(normalizedName)) return true;
 	if (mode === "db" && RAW_DATABASE_TAGS.has(tag)) return true;
 	if (RAW_DATABASE_TAGS.has(tag)) return false;
 

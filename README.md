@@ -35,7 +35,8 @@ Selected upstream Dokploy API access is available through `raw_*` tools. By defa
 
 Raw tool visibility can be adjusted with `DOKPLOY_SAFE_RAW_MODE`:
 
-- `minimal` (default): selected raw query/troubleshooting tools only.
+- `strict` (default): only the small raw troubleshooting whitelist needed for project, compose, application, deployment, Docker container, permission, and Traefik-read checks.
+- `minimal`: a wider raw query/troubleshooting set for administrator debugging.
 - `db`: selected raw query/troubleshooting tools plus full upstream raw database tools such as Postgres, MySQL, MariaDB, Mongo, Redis, and LibSQL. Prefer safe database tools first.
 - `off`: hide all upstream `raw_*` tools.
 - `full`: expose all upstream `raw_*` tools and `dokploy_raw_api`; use only for temporary administrator troubleshooting.
