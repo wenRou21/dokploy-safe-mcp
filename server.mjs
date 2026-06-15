@@ -770,9 +770,9 @@ server.tool(
 	[
 		"Preferred tool for deploying a simple static page to this Dokploy host.",
 		"Use this before or instead of raw dokploy MCP for static-page deployments.",
-		"Deploy a simple static page to Dokploy using nginx:alpine, then publish and verify a safe path route.",
-		"It creates a project, production environment, raw docker-compose compose, forces compose.update with sourceType=raw,",
-		"deploys the compose, publishes through /join/routes, and verifies http://183.196.108.32:18080/<path>/ returns 200.",
+		"Deploy a simple static page through the upload gateway, then publish and verify a safe path route.",
+		"It writes the HTML to a temporary local directory and reuses dokploy_deploy_from_local_archive in static mode.",
+		"The upload gateway creates the raw compose, deploys it, publishes through /join/routes, and verifies http://183.196.108.32:18080/<path>/ returns 200.",
 		"Use this instead of manually assuming 80/443 or writing Traefik files.",
 	].join(" "),
 	{
@@ -796,89 +796,36 @@ async function deployStaticPage(input) {
 	const stamp = timestampSlug();
 	const random = Math.random().toString(36).slice(2, 8);
 	const baseName = sanitizeName(input.name || `safe-static-${stamp}-${random}`);
-	const path = normalizePath(input.path || `/${baseName}`);
-	validatePath(path);
-
-	const projectName = baseName;
-	const environmentName = "production";
-	const composeName = `${baseName}-compose`;
-	const serviceName = "app";
-	const port = 80;
+	const publicPath = normalizePath(input.path || `/${baseName}`);
+	validatePath(publicPath);
 	const title = input.title || "Dokploy Safe Static Page";
-	const html = input.html || defaultHtml(title, path);
-	const composeFile = buildStaticCompose(serviceName, html);
 	const startedAt = new Date().toISOString();
+	const html = input.html || defaultHtml(title, publicPath);
+	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), `dokploy-static-${baseName}-`));
 
-	const project = await dokploy("POST", "/project.create", {
-		name: projectName,
-		description: "Static page deployed through dokploy-safe-mcp",
-	});
-	const projectId = pickId(project, "projectId");
-	const environment = project.environment || await dokploy("POST", "/environment.create", {
-		name: environmentName,
-		description: "Created by dokploy-safe-mcp",
-		projectId,
-	});
-	const environmentId = pickId(environment, "environmentId");
+	try {
+		await fs.writeFile(path.join(tempRoot, "index.html"), html, "utf8");
+		const result = await deployFromLocalArchive({
+			sourcePath: tempRoot,
+			name: baseName,
+			path: publicPath,
+			mode: "static",
+			port: 80,
+			env: {},
+			verifyTimeoutMs: input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS,
+		});
 
-	const compose = await dokploy("POST", "/compose.create", {
-		name: composeName,
-		description: "Static nginx page deployed through dokploy-safe-mcp",
-		environmentId,
-		composeType: "docker-compose",
-		appName: composeName,
-		composeFile,
-	});
-	const composeId = pickId(compose, "composeId");
-
-	await dokploy("POST", "/compose.update", {
-		composeId,
-		name: composeName,
-		appName: composeName,
-		description: "Static nginx page deployed through dokploy-safe-mcp",
-		composeFile,
-		sourceType: "raw",
-		composeType: "docker-compose",
-		composeStatus: "idle",
-		repository: null,
-		owner: null,
-		branch: null,
-		autoDeploy: false,
-	});
-
-	await dokploy("POST", "/compose.deploy", {
-		composeId,
-		title: "Deploy static page",
-		description: "dokploy-safe-mcp deploy_static_page",
-	});
-
-	const timeoutMs = input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS;
-	const deployment = await waitForComposeDeployment(composeId, timeoutMs);
-	const route = await publishRouteAndVerify({
-		path,
-		composeId,
-		serviceName,
-		port,
-		verifyTimeoutMs: timeoutMs,
-	});
-
-	return {
-		ok: true,
-		kind: "static-compose",
-		message: "Static page deployed, route published, and public URL verified.",
-		url: route.url,
-		path,
-		projectId,
-		environmentId,
-		composeId,
-		serviceName,
-		port,
-		deployment,
-		route,
-		startedAt,
-		completedAt: new Date().toISOString(),
-		rulesApplied: platformRules(),
-	};
+		return {
+			...result,
+			kind: "static-upload",
+			message: "Static page deployed through upload gateway, route published, and public URL verified.",
+			startedAt,
+			completedAt: new Date().toISOString(),
+			rulesApplied: platformRules(),
+		};
+	} finally {
+		await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
+	}
 }
 
 async function prepareUploadSlot(name) {
@@ -955,25 +902,10 @@ async function uploadAndDeploy(input) {
 async function waitForUploadDeploymentTask(initial, timeoutMs) {
 	const deadline = Date.now() + timeoutMs;
 	let last = initial;
-	const statusUrl = `${UPLOAD_STATUS_URL}/${encodeURIComponent(initial.taskId)}`;
 
 	while (Date.now() < deadline) {
-		const url = new URL(statusUrl);
-		url.searchParams.set("apiKey", API_KEY);
 		try {
-			const response = await fetch(url, {
-				method: "GET",
-				headers: { Accept: "application/json" },
-				signal: AbortSignal.timeout(30000),
-			});
-			const text = await response.text();
-			const data = parseJsonText(text);
-			if (!response.ok) {
-				const message = typeof data === "object" && data
-					? data.message || data.error || JSON.stringify(data)
-					: text;
-				throw new Error(`Upload deployment status failed: HTTP ${response.status} ${response.statusText}: ${message}`);
-			}
+			const data = await fetchUploadDeploymentStatus(initial.taskId);
 			last = data;
 			if (data?.status === "done" && data.result) {
 				return {
@@ -1004,6 +936,44 @@ async function waitForUploadDeploymentTask(initial, timeoutMs) {
 	}
 
 	throw new Error(`Timed out waiting for uploaded deployment task ${initial.taskId}. Last status: ${JSON.stringify(last)}`);
+}
+
+async function fetchUploadDeploymentStatus(taskId) {
+	const pathUrl = new URL(`${UPLOAD_STATUS_URL}/${encodeURIComponent(taskId)}`);
+	pathUrl.searchParams.set("apiKey", API_KEY);
+	const queryUrl = new URL(UPLOAD_STATUS_URL);
+	queryUrl.searchParams.set("apiKey", API_KEY);
+	queryUrl.searchParams.set("taskId", taskId);
+
+	let firstError = null;
+	for (const url of [pathUrl, queryUrl]) {
+		try {
+			return await fetchUploadStatusUrl(url);
+		} catch (error) {
+			firstError ||= error;
+			if (!/HTTP 404\b/.test(error.message)) {
+				throw error;
+			}
+		}
+	}
+	throw firstError;
+}
+
+async function fetchUploadStatusUrl(url) {
+	const response = await fetch(url, {
+		method: "GET",
+		headers: { Accept: "application/json" },
+		signal: AbortSignal.timeout(30000),
+	});
+	const text = await response.text();
+	const data = parseJsonText(text);
+	if (!response.ok) {
+		const message = typeof data === "object" && data
+			? data.message || data.error || JSON.stringify(data)
+			: text;
+		throw new Error(`Upload deployment status failed: HTTP ${response.status} ${response.statusText}: ${message}`);
+	}
+	return data;
 }
 
 async function publishRouteAndVerify(input) {

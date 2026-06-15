@@ -43,7 +43,7 @@ Raw tool visibility can be adjusted with `DOKPLOY_SAFE_RAW_MODE`:
 
 For clients that need a specific upstream subset, `DOKPLOY_ENABLED_TAGS` can still override this filter with a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
 
-The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish/remove routes through `/join/routes`, and verify the final public URL state.
+The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish/remove routes through `/join/routes`, and verify the final public URL state. `dokploy_deploy_static_page` uses the same upload gateway as `dokploy_deploy_from_local_archive` in static mode, which is the preferred path for simple static pages.
 
 ## Dokploy-Native Databases
 
