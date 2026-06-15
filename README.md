@@ -14,6 +14,13 @@ Core safe tools:
 - `dokploy_prepare_upload_slot`
 - `dokploy_deploy_from_local_archive`
 - `dokploy_get_project_status`
+- `dokploy_database_search`
+- `dokploy_create_postgres`
+- `dokploy_create_mysql`
+- `dokploy_create_mariadb`
+- `dokploy_create_mongo`
+- `dokploy_create_redis`
+- `dokploy_create_libsql`
 - `dokploy_delete_project`
 - `dokploy_cleanup_failed_deploy`
 
@@ -24,18 +31,35 @@ Common Dokploy tools included:
 - application search/detail/deploy/logs
 - compose search/detail/create/update/deploy/deployments/logs
 
-Selected upstream Dokploy API access is available through `raw_*` tools. By default the MCP exposes useful raw query, logging, permissions, Traefik-read, and database tools, while hiding low-frequency or risky raw write tools. Normal user workflows should prefer `dokploy_deploy_from_local_archive`, `dokploy_get_project_status`, `dokploy_delete_project`, and `dokploy_cleanup_failed_deploy`.
+Selected upstream Dokploy API access is available through `raw_*` tools. By default the MCP exposes useful raw query, logging, permissions, and Traefik-read tools while hiding low-frequency or risky raw write tools. Normal user workflows should prefer `dokploy_deploy_from_local_archive`, `dokploy_get_project_status`, the safe database tools, `dokploy_delete_project`, and `dokploy_cleanup_failed_deploy`.
 
 Raw tool visibility can be adjusted with `DOKPLOY_SAFE_RAW_MODE`:
 
-- `db` (default): selected raw query/troubleshooting tools plus database tools such as Postgres, MySQL, MariaDB, Mongo, Redis, and LibSQL.
-- `minimal`: selected raw query/troubleshooting tools only.
+- `minimal` (default): selected raw query/troubleshooting tools only.
+- `db`: selected raw query/troubleshooting tools plus full upstream raw database tools such as Postgres, MySQL, MariaDB, Mongo, Redis, and LibSQL. Prefer safe database tools first.
 - `off`: hide all upstream `raw_*` tools.
 - `full`: expose all upstream `raw_*` tools and `dokploy_raw_api`; use only for temporary administrator troubleshooting.
 
 For clients that need a specific upstream subset, `DOKPLOY_ENABLED_TAGS` can still override this filter with a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
 
 The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish/remove routes through `/join/routes`, and verify the final public URL state.
+
+## Dokploy-Native Databases
+
+For projects that need Dokploy-managed databases, use the safe database tools instead of enabling all raw database tools:
+
+- `dokploy_database_search`
+- `dokploy_database_one`
+- `dokploy_database_deploy`
+- `dokploy_database_read_logs`
+- `dokploy_create_postgres`
+- `dokploy_create_mysql`
+- `dokploy_create_mariadb`
+- `dokploy_create_mongo`
+- `dokploy_create_redis`
+- `dokploy_create_libsql`
+
+The create tools call the corresponding Dokploy database API and can deploy the resource after creation. If a password is omitted, the MCP generates one for Dokploy but does not return it in the MCP response. If an app only defines `postgres`, `mysql`, or similar services inside its own `docker-compose.yml`, these database tools are not required.
 
 ## Local Project Uploads
 

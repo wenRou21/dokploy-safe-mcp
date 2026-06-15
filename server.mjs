@@ -19,7 +19,7 @@ const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const RAW_TOOL_PREFIX = "raw_";
 const MCP_NAME = "dokploy-safe-mcp";
 const MCP_VERSION = "1.0.0";
-const RAW_MODE = String(process.env.DOKPLOY_SAFE_RAW_MODE || "db").trim().toLowerCase();
+const RAW_MODE = String(process.env.DOKPLOY_SAFE_RAW_MODE || "minimal").trim().toLowerCase();
 const UPLOAD_URL = process.env.DOKPLOY_UPLOAD_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_STATUS_URL = process.env.DOKPLOY_UPLOAD_STATUS_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_MAX_BYTES = Number(process.env.DOKPLOY_UPLOAD_MAX_MB || 500) * 1024 * 1024;
@@ -157,7 +157,7 @@ const server = new McpServer({
 		"This server is the single preferred MCP entry point for Dokploy on this host.",
 		"It includes safe deployment/route publishing tools plus common Dokploy inspection and management tools.",
 		"Before deploying to Dokploy or publishing a public path, use dokploy_deploy_static_page or dokploy_publish_route.",
-		"By default it exposes only selected raw_* Dokploy tools for troubleshooting and database management.",
+		"By default it exposes only selected raw_* Dokploy tools for troubleshooting. Use safe database tools for Dokploy-native databases.",
 		"Set DOKPLOY_SAFE_RAW_MODE=full only for temporary administrator troubleshooting.",
 		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
 		"Member API keys normally cannot write Traefik files directly. Use /join/routes through dokploy_publish_route or dokploy_deploy_static_page.",
@@ -184,6 +184,9 @@ server.tool(
 			"dokploy_publish_route",
 			"dokploy_unpublish_route",
 			"dokploy_get_project_status",
+			"dokploy_create_postgres",
+			"dokploy_create_mysql",
+			"dokploy_create_redis",
 			"dokploy_delete_project",
 			"dokploy_cleanup_failed_deploy",
 		],
@@ -427,6 +430,191 @@ server.tool(
 		search: z.string().optional(),
 	},
 	async (input) => jsonToolResult(await dokploy("GET", "/compose.readLogs", input)),
+);
+
+server.tool(
+	"dokploy_database_search",
+	[
+		"Search/list Dokploy-native database resources visible to the configured API key.",
+		"Use this safe tool instead of raw database search tools in normal workflows.",
+	].join(" "),
+	{
+		type: z.enum(["postgres", "mysql", "mariadb", "mongo", "redis", "libsql"]).describe("Dokploy-native database type."),
+		limit: z.number().int().positive().max(100).optional(),
+		offset: z.number().int().nonnegative().optional(),
+		name: z.string().optional(),
+		q: z.string().optional(),
+		projectId: z.string().optional(),
+		environmentId: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await databaseSearch(input)),
+);
+
+server.tool(
+	"dokploy_database_one",
+	"Get one Dokploy-native database resource by ID.",
+	{
+		type: z.enum(["postgres", "mysql", "mariadb", "mongo", "redis", "libsql"]),
+		id: z.string().describe("Database resource ID, for example postgresId/mysqlId/redisId."),
+	},
+	async (input) => jsonToolResult(redactDatabaseResult(await databaseOne(input.type, input.id), input.type)),
+);
+
+server.tool(
+	"dokploy_database_deploy",
+	"Deploy an existing Dokploy-native database resource.",
+	{
+		type: z.enum(["postgres", "mysql", "mariadb", "mongo", "redis", "libsql"]),
+		id: z.string().describe("Database resource ID, for example postgresId/mysqlId/redisId."),
+	},
+	async (input) => jsonToolResult(await databaseDeploy(input.type, input.id)),
+);
+
+server.tool(
+	"dokploy_database_read_logs",
+	"Read logs for a Dokploy-native database resource.",
+	{
+		type: z.enum(["postgres", "mysql", "mariadb", "mongo", "redis", "libsql"]),
+		id: z.string().describe("Database resource ID, for example postgresId/mysqlId/redisId."),
+		tail: z.number().int().positive().max(10000).default(100),
+		since: z.string().default("all").describe("Log time window, for example all, 10m, 1h."),
+		search: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await databaseReadLogs(input)),
+);
+
+server.tool(
+	"dokploy_create_postgres",
+	[
+		"Create a Dokploy-native Postgres database safely.",
+		"Use this when a new project needs managed Postgres without exposing the full raw database tool set.",
+		"The returned result omits passwords.",
+	].join(" "),
+	{
+		environmentId: z.string(),
+		name: z.string().describe("Human-readable database resource name."),
+		appName: z.string().optional().describe("Optional Docker/app name. If omitted, a safe name is generated."),
+		databaseName: z.string().default("app"),
+		databaseUser: z.string().default("app"),
+		databasePassword: z.string().optional().describe("Optional password. If omitted, a strong password is generated and not returned."),
+		dockerImage: z.string().default("postgres:18"),
+		description: z.string().nullable().optional(),
+		serverId: z.string().nullable().optional(),
+		deploy: z.boolean().default(true).describe("Deploy the database after creation."),
+	},
+	async (input) => jsonToolResult(await createManagedDatabase("postgres", input)),
+);
+
+server.tool(
+	"dokploy_create_mysql",
+	[
+		"Create a Dokploy-native MySQL database safely.",
+		"Use this when a new project needs managed MySQL without exposing the full raw database tool set.",
+		"The returned result omits passwords.",
+	].join(" "),
+	{
+		environmentId: z.string(),
+		name: z.string(),
+		appName: z.string().optional(),
+		databaseName: z.string().default("app"),
+		databaseUser: z.string().default("app"),
+		databasePassword: z.string().optional(),
+		databaseRootPassword: z.string().optional(),
+		dockerImage: z.string().default("mysql:8"),
+		description: z.string().nullable().optional(),
+		serverId: z.string().nullable().optional(),
+		deploy: z.boolean().default(true),
+	},
+	async (input) => jsonToolResult(await createManagedDatabase("mysql", input)),
+);
+
+server.tool(
+	"dokploy_create_mariadb",
+	[
+		"Create a Dokploy-native MariaDB database safely.",
+		"Use this when a new project needs managed MariaDB without exposing the full raw database tool set.",
+		"The returned result omits passwords.",
+	].join(" "),
+	{
+		environmentId: z.string(),
+		name: z.string(),
+		appName: z.string().optional(),
+		databaseName: z.string().default("app"),
+		databaseUser: z.string().default("app"),
+		databasePassword: z.string().optional(),
+		databaseRootPassword: z.string().optional(),
+		dockerImage: z.string().default("mariadb:6"),
+		description: z.string().nullable().optional(),
+		serverId: z.string().nullable().optional(),
+		deploy: z.boolean().default(true),
+	},
+	async (input) => jsonToolResult(await createManagedDatabase("mariadb", input)),
+);
+
+server.tool(
+	"dokploy_create_mongo",
+	[
+		"Create a Dokploy-native MongoDB database safely.",
+		"Use this when a new project needs managed MongoDB without exposing the full raw database tool set.",
+		"The returned result omits passwords.",
+	].join(" "),
+	{
+		environmentId: z.string(),
+		name: z.string(),
+		appName: z.string().optional(),
+		databaseUser: z.string().default("app"),
+		databasePassword: z.string().optional(),
+		dockerImage: z.string().default("mongo:15"),
+		replicaSets: z.boolean().nullable().optional(),
+		description: z.string().nullable().optional(),
+		serverId: z.string().nullable().optional(),
+		deploy: z.boolean().default(true),
+	},
+	async (input) => jsonToolResult(await createManagedDatabase("mongo", input)),
+);
+
+server.tool(
+	"dokploy_create_redis",
+	[
+		"Create a Dokploy-native Redis database safely.",
+		"Use this when a new project needs managed Redis without exposing the full raw database tool set.",
+		"The returned result omits passwords.",
+	].join(" "),
+	{
+		environmentId: z.string(),
+		name: z.string(),
+		appName: z.string().optional(),
+		databasePassword: z.string().optional(),
+		dockerImage: z.string().default("redis:8"),
+		description: z.string().nullable().optional(),
+		serverId: z.string().nullable().optional(),
+		deploy: z.boolean().default(true),
+	},
+	async (input) => jsonToolResult(await createManagedDatabase("redis", input)),
+);
+
+server.tool(
+	"dokploy_create_libsql",
+	[
+		"Create a Dokploy-native LibSQL database safely.",
+		"Use this when a new project needs managed LibSQL without exposing the full raw database tool set.",
+		"The returned result omits passwords.",
+	].join(" "),
+	{
+		environmentId: z.string(),
+		name: z.string(),
+		appName: z.string().optional(),
+		databaseUser: z.string().default("app"),
+		databasePassword: z.string().optional(),
+		sqldNode: z.enum(["primary", "replica"]).default("primary"),
+		sqldPrimaryUrl: z.string().nullable().optional(),
+		enableNamespaces: z.boolean().default(false),
+		dockerImage: z.string().default("ghcr.io/tursodatabase/libsql-server:v0.24.32"),
+		description: z.string().nullable().optional(),
+		serverId: z.string().nullable().optional(),
+		deploy: z.boolean().default(true),
+	},
+	async (input) => jsonToolResult(await createManagedDatabase("libsql", input)),
 );
 
 server.tool(
@@ -1251,6 +1439,220 @@ async function dokploy(method, path, data) {
 	return httpJsonWithRetry(url, init);
 }
 
+async function databaseSearch(input) {
+	const type = normalizeDatabaseType(input.type);
+	const result = await dokploy("GET", `/${type}.search`, {
+		limit: clampSearchLimit(input.limit),
+		offset: input.offset || 0,
+		name: input.name,
+		q: input.q,
+		projectId: input.projectId,
+		environmentId: input.environmentId,
+	});
+
+	return redactDatabaseResult(result, type);
+}
+
+async function databaseOne(typeInput, id) {
+	const type = normalizeDatabaseType(typeInput);
+	const idField = databaseIdField(type);
+	return dokploy("GET", `/${type}.one`, { [idField]: id });
+}
+
+async function databaseDeploy(typeInput, id) {
+	const type = normalizeDatabaseType(typeInput);
+	const idField = databaseIdField(type);
+	return dokploy("POST", `/${type}.deploy`, { [idField]: id });
+}
+
+async function databaseReadLogs(input) {
+	const type = normalizeDatabaseType(input.type);
+	const idField = databaseIdField(type);
+	return dokploy("GET", `/${type}.readLogs`, {
+		[idField]: input.id,
+		tail: input.tail || 100,
+		since: input.since || "all",
+		search: input.search,
+	});
+}
+
+async function createManagedDatabase(typeInput, input) {
+	assertConfigured();
+
+	const type = normalizeDatabaseType(typeInput);
+	const payload = buildManagedDatabasePayload(type, input);
+	const created = await dokploy("POST", `/${type}.create`, payload);
+	const idField = databaseIdField(type);
+	const id = findDatabaseId(created, type);
+	const steps = [{ step: `${type}.create`, ok: true }];
+
+	let deployResult = null;
+	if (input.deploy !== false && id) {
+		deployResult = await dokploy("POST", `/${type}.deploy`, { [idField]: id });
+		steps.push({ step: `${type}.deploy`, ok: true });
+	}
+
+	return {
+		ok: true,
+		type,
+		id,
+		idField,
+		name: payload.name,
+		appName: payload.appName,
+		environmentId: payload.environmentId,
+		databaseName: payload.databaseName,
+		databaseUser: payload.databaseUser,
+		dockerImage: payload.dockerImage,
+		passwordReturned: false,
+		internalConnection: managedDatabaseConnectionHint(type, payload),
+		created: redactDatabaseResult(created, type),
+		deployResult: deployResult ? redactDatabaseResult(deployResult, type) : null,
+		steps,
+	};
+}
+
+function buildManagedDatabasePayload(type, input) {
+	const name = sanitizeName(input.name);
+	const payload = {
+		name,
+		appName: input.appName ? sanitizeAppName(input.appName) : `${name}-${type}`.slice(0, 63),
+		dockerImage: input.dockerImage || defaultDatabaseImage(type),
+		environmentId: input.environmentId,
+		description: input.description ?? null,
+		serverId: input.serverId ?? null,
+	};
+
+	if (["postgres", "mysql", "mariadb"].includes(type)) {
+		payload.databaseName = input.databaseName || "app";
+		payload.databaseUser = input.databaseUser || "app";
+		payload.databasePassword = input.databasePassword || generateSafePassword();
+	}
+
+	if (type === "mysql" || type === "mariadb") {
+		payload.databaseRootPassword = input.databaseRootPassword || generateSafePassword();
+	}
+
+	if (type === "mongo") {
+		payload.databaseUser = input.databaseUser || "app";
+		payload.databasePassword = input.databasePassword || generateSafePassword();
+		if (input.replicaSets !== undefined) payload.replicaSets = input.replicaSets;
+	}
+
+	if (type === "redis") {
+		payload.databasePassword = input.databasePassword || generateSafePassword();
+	}
+
+	if (type === "libsql") {
+		payload.databaseUser = input.databaseUser || "app";
+		payload.databasePassword = input.databasePassword || generateSafePassword();
+		payload.sqldNode = input.sqldNode || "primary";
+		payload.sqldPrimaryUrl = input.sqldPrimaryUrl ?? null;
+		payload.enableNamespaces = input.enableNamespaces || false;
+	}
+
+	return payload;
+}
+
+function normalizeDatabaseType(type) {
+	const normalized = String(type || "").trim().toLowerCase();
+	if (!RAW_DATABASE_TAGS.has(normalized)) {
+		throw new Error(`Unsupported database type: ${type}`);
+	}
+	return normalized;
+}
+
+function databaseIdField(type) {
+	return `${type}Id`;
+}
+
+function defaultDatabaseImage(type) {
+	return {
+		postgres: "postgres:18",
+		mysql: "mysql:8",
+		mariadb: "mariadb:6",
+		mongo: "mongo:15",
+		redis: "redis:8",
+		libsql: "ghcr.io/tursodatabase/libsql-server:v0.24.32",
+	}[type];
+}
+
+function findDatabaseId(value, type) {
+	const field = databaseIdField(type);
+	return value?.[field]
+		|| value?.data?.[field]
+		|| value?.database?.[field]
+		|| value?.[type]?.[field]
+		|| value?.id
+		|| value?.data?.id
+		|| null;
+}
+
+function managedDatabaseConnectionHint(type, payload) {
+	const host = payload.appName || payload.name;
+	if (type === "postgres") {
+		return {
+			host,
+			port: 5432,
+			database: payload.databaseName,
+			user: payload.databaseUser,
+			password: "<stored in Dokploy; not returned>",
+			urlExample: `postgresql://${payload.databaseUser}:<password>@${host}:5432/${payload.databaseName}`,
+		};
+	}
+	if (type === "mysql" || type === "mariadb") {
+		return {
+			host,
+			port: 3306,
+			database: payload.databaseName,
+			user: payload.databaseUser,
+			password: "<stored in Dokploy; not returned>",
+			urlExample: `mysql://${payload.databaseUser}:<password>@${host}:3306/${payload.databaseName}`,
+		};
+	}
+	if (type === "mongo") {
+		return {
+			host,
+			port: 27017,
+			user: payload.databaseUser,
+			password: "<stored in Dokploy; not returned>",
+			urlExample: `mongodb://${payload.databaseUser}:<password>@${host}:27017`,
+		};
+	}
+	if (type === "redis") {
+		return {
+			host,
+			port: 6379,
+			password: "<stored in Dokploy; not returned>",
+			urlExample: `redis://:<password>@${host}:6379`,
+		};
+	}
+	if (type === "libsql") {
+		return {
+			host,
+			port: 8080,
+			user: payload.databaseUser,
+			password: "<stored in Dokploy; not returned>",
+		};
+	}
+	return { host };
+}
+
+function redactDatabaseResult(value, type) {
+	return deepRedact(value, [
+		"password",
+		"databasePassword",
+		"databaseRootPassword",
+		"POSTGRES_PASSWORD",
+		"MYSQL_PASSWORD",
+		"MYSQL_ROOT_PASSWORD",
+		"MARIADB_PASSWORD",
+		"MARIADB_ROOT_PASSWORD",
+		"MONGO_INITDB_ROOT_PASSWORD",
+		"REDIS_PASSWORD",
+		`${type?.toUpperCase?.() || "DATABASE"}_PASSWORD`,
+	]);
+}
+
 async function httpJsonWithRetry(url, init, attempts = 3) {
 	let lastError;
 	for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -1701,6 +2103,7 @@ function isRawToolAllowed(tool, mode) {
 
 	if (RAW_MINIMAL_TOOL_NAMES.has(normalizedName)) return true;
 	if (mode === "db" && RAW_DATABASE_TAGS.has(tag)) return true;
+	if (RAW_DATABASE_TAGS.has(tag)) return false;
 
 	if (RAW_BLOCKED_TAGS.has(tag)) return false;
 	if (RAW_BLOCKED_NAME_PATTERNS.some((pattern) => pattern.test(normalizedName))) return false;
@@ -1896,6 +2299,46 @@ function sanitizeName(name) {
 	return safe || `safe-static-${timestampSlug()}`;
 }
 
+function sanitizeAppName(name) {
+	const safe = String(name)
+		.toLowerCase()
+		.replace(/[^a-z0-9._-]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 63);
+
+	return safe || `dokploy-safe-${timestampSlug()}`;
+}
+
+function generateSafePassword(length = 32) {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+	let result = "";
+	for (let i = 0; i < length; i++) {
+		result += alphabet[Math.floor(Math.random() * alphabet.length)];
+	}
+	return result;
+}
+
+function deepRedact(value, keys) {
+	const keySet = new Set(keys.map((key) => String(key).toLowerCase()));
+	const redact = (item) => {
+		if (Array.isArray(item)) return item.map(redact);
+		if (!item || typeof item !== "object") return item;
+
+		const output = {};
+		for (const [key, nested] of Object.entries(item)) {
+			const lower = key.toLowerCase();
+			if (keySet.has(lower) || lower.includes("password") || lower.endsWith("_key") || lower.includes("secret")) {
+				output[key] = "<redacted>";
+			} else {
+				output[key] = redact(nested);
+			}
+		}
+		return output;
+	};
+
+	return redact(value);
+}
+
 function timestampSlug() {
 	const d = new Date();
 	const pad = (n) => String(n).padStart(2, "0");
@@ -2014,6 +2457,7 @@ function platformRules() {
 		"Publish routes through POST /join/routes.",
 		"/join/routes creates Host(183.196.108.32) && PathPrefix(/xxx) and defaults stripPrefix.",
 		"Compose targets use serviceName + internal port; application targets use applicationId + internal port.",
+		"For Dokploy-native databases, use dokploy_create_postgres/mysql/mariadb/mongo/redis/libsql instead of enabling raw database tools.",
 		"Never point services at localhost.",
 	];
 }
