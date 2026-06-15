@@ -2,7 +2,7 @@
 
 Single MCP entry point for this Dokploy host.
 
-It includes high-level deployment workflow tools plus the upstream Dokploy OpenAPI tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
+It includes high-level deployment workflow tools plus selected upstream Dokploy OpenAPI tools, so users can usually configure only this MCP instead of also configuring `@dokploy/mcp`.
 
 Core safe tools:
 
@@ -24,9 +24,16 @@ Common Dokploy tools included:
 - application search/detail/deploy/logs
 - compose search/detail/create/update/deploy/deployments/logs
 
-Full upstream Dokploy API access is also available through `raw_*` tools, for example `raw_project_all`, `raw_compose_update`, and `raw_application_deploy`. These are intended for administrator troubleshooting. Normal user workflows should prefer `dokploy_deploy_from_local_archive`, `dokploy_get_project_status`, `dokploy_delete_project`, and `dokploy_cleanup_failed_deploy`.
+Selected upstream Dokploy API access is available through `raw_*` tools. By default the MCP exposes useful raw query, logging, permissions, Traefik-read, and database tools, while hiding low-frequency or risky raw write tools. Normal user workflows should prefer `dokploy_deploy_from_local_archive`, `dokploy_get_project_status`, `dokploy_delete_project`, and `dokploy_cleanup_failed_deploy`.
 
-For clients that cannot handle a very large tool list, set `DOKPLOY_ENABLED_TAGS` to a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
+Raw tool visibility can be adjusted with `DOKPLOY_SAFE_RAW_MODE`:
+
+- `db` (default): selected raw query/troubleshooting tools plus database tools such as Postgres, MySQL, MariaDB, Mongo, Redis, and LibSQL.
+- `minimal`: selected raw query/troubleshooting tools only.
+- `off`: hide all upstream `raw_*` tools.
+- `full`: expose all upstream `raw_*` tools and `dokploy_raw_api`; use only for temporary administrator troubleshooting.
+
+For clients that need a specific upstream subset, `DOKPLOY_ENABLED_TAGS` can still override this filter with a comma-separated tag list such as `project,environment,application,compose,deployment`. Safe tools are always included.
 
 The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish/remove routes through `/join/routes`, and verify the final public URL state.
 

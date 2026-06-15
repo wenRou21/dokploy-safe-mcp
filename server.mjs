@@ -19,6 +19,7 @@ const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const RAW_TOOL_PREFIX = "raw_";
 const MCP_NAME = "dokploy-safe-mcp";
 const MCP_VERSION = "1.0.0";
+const RAW_MODE = String(process.env.DOKPLOY_SAFE_RAW_MODE || "db").trim().toLowerCase();
 const UPLOAD_URL = process.env.DOKPLOY_UPLOAD_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_STATUS_URL = process.env.DOKPLOY_UPLOAD_STATUS_URL || `${PUBLIC_HTTP_URL}/join/deployments`;
 const UPLOAD_MAX_BYTES = Number(process.env.DOKPLOY_UPLOAD_MAX_MB || 500) * 1024 * 1024;
@@ -34,6 +35,108 @@ const USAGE_NODE_ID = process.env.DOKPLOY_SAFE_USAGE_NODE_ID || defaultUsageNode
 const USAGE_REMOTE_ENABLED = truthyEnv(process.env.DOKPLOY_SAFE_USAGE_REMOTE ?? "1")
 	&& Boolean(USAGE_ENDPOINT)
 	&& Boolean(USAGE_TOKEN);
+
+const RAW_MINIMAL_TOOL_NAMES = new Set([
+	"project_all",
+	"project_one",
+	"environment_byProjectId",
+	"compose_search",
+	"compose_one",
+	"compose_readLogs",
+	"application_search",
+	"application_one",
+	"application_readLogs",
+	"deployment_allByCompose",
+	"deployment_queueList",
+	"docker_getContainers",
+	"user_getPermissions",
+	"user_session",
+	"organization_all",
+	"customRole_all",
+	"customRole_getStatements",
+	"settings_readTraefikFile",
+	"settings_readTraefikConfig",
+	"settings_readWebServerTraefikConfig",
+]);
+
+const RAW_DATABASE_TAGS = new Set([
+	"postgres",
+	"mysql",
+	"mariadb",
+	"mongo",
+	"redis",
+	"libsql",
+]);
+
+const RAW_QUERY_TAGS = new Set([
+	"project",
+	"environment",
+	"compose",
+	"application",
+	"deployment",
+	"docker",
+	"user",
+	"organization",
+	"customrole",
+	"settings",
+]);
+
+const RAW_BLOCKED_TAGS = new Set([
+	"ai",
+	"admin",
+	"auditlog",
+	"backup",
+	"bitbucket",
+	"certificates",
+	"cluster",
+	"destination",
+	"domain",
+	"gitprovider",
+	"github",
+	"gitea",
+	"gitlab",
+	"licensekey",
+	"mounts",
+	"notification",
+	"patch",
+	"port",
+	"previewdeployment",
+	"redirects",
+	"registry",
+	"rollback",
+	"schedule",
+	"security",
+	"sso",
+	"sshkey",
+	"stripe",
+	"swarm",
+	"tag",
+	"volumebackups",
+	"whitelabeling",
+]);
+
+const RAW_BLOCKED_NAME_PATTERNS = [
+	/traefik.*update/i,
+	/update.*traefik/i,
+	/reloadtraefik/i,
+	/create$/i,
+	/update$/i,
+	/delete$/i,
+	/remove$/i,
+	/deploy$/i,
+	/redeploy$/i,
+	/reload$/i,
+	/start$/i,
+	/stop$/i,
+	/kill/i,
+	/cancel/i,
+	/save/i,
+	/clear/i,
+	/clean/i,
+	/move/i,
+	/disconnect/i,
+	/drop/i,
+];
 
 const RESERVED_PATHS = new Set([
 	"api",
@@ -54,7 +157,8 @@ const server = new McpServer({
 		"This server is the single preferred MCP entry point for Dokploy on this host.",
 		"It includes safe deployment/route publishing tools plus common Dokploy inspection and management tools.",
 		"Before deploying to Dokploy or publishing a public path, use dokploy_deploy_static_page or dokploy_publish_route.",
-		"It also exposes the full upstream Dokploy MCP API as raw_* tools for advanced operations.",
+		"By default it exposes only selected raw_* Dokploy tools for troubleshooting and database management.",
+		"Set DOKPLOY_SAFE_RAW_MODE=full only for temporary administrator troubleshooting.",
 		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
 		"Member API keys normally cannot write Traefik files directly. Use /join/routes through dokploy_publish_route or dokploy_deploy_static_page.",
 		"New public deployments must use a unique path prefix and verify the final public URL returns 200.",
@@ -90,16 +194,18 @@ server.tool(
 	}),
 );
 
-server.tool(
-	"dokploy_raw_api",
-	"Advanced escape hatch for any Dokploy OpenAPI endpoint. Prefer named safe tools for deployment and route publishing. Use method GET or POST and a path such as /project.all or /compose.update.",
-	{
-		method: z.enum(["GET", "POST"]),
-		path: z.string().describe("Dokploy API path, for example /project.all or /compose.update."),
-		params: z.record(z.any()).optional().describe("GET query parameters or POST JSON body."),
-	},
-	async (input) => jsonToolResult(await dokploy(input.method, normalizeApiPath(input.path), input.params || {})),
-);
+if (RAW_MODE === "full") {
+	server.tool(
+		"dokploy_raw_api",
+		"Advanced escape hatch for any Dokploy OpenAPI endpoint. Prefer named safe tools for deployment and route publishing. Use method GET or POST and a path such as /project.all or /compose.update.",
+		{
+			method: z.enum(["GET", "POST"]),
+			path: z.string().describe("Dokploy API path, for example /project.all or /compose.update."),
+			params: z.record(z.any()).optional().describe("GET query parameters or POST JSON body."),
+		},
+		async (input) => jsonToolResult(await dokploy(input.method, normalizeApiPath(input.path), input.params || {})),
+	);
+}
 
 server.tool(
 	"dokploy_connection_check",
@@ -1566,16 +1672,44 @@ async function reportUsage(entry) {
 
 function getEnabledUpstreamTools() {
 	const enabledTags = process.env.DOKPLOY_ENABLED_TAGS;
-	if (!enabledTags) {
+	if (enabledTags) {
+		const tags = new Set(enabledTags
+			.split(",")
+			.map((tag) => tag.trim().toLowerCase())
+			.filter(Boolean));
+
+		return upstreamDokployTools.filter((tool) => tags.has(tool.tag.toLowerCase()));
+	}
+
+	if (RAW_MODE === "full") {
 		return upstreamDokployTools;
 	}
 
-	const tags = new Set(enabledTags
-		.split(",")
-		.map((tag) => tag.trim().toLowerCase())
-		.filter(Boolean));
+	if (RAW_MODE === "off" || RAW_MODE === "none" || RAW_MODE === "0") {
+		return [];
+	}
 
-	return upstreamDokployTools.filter((tool) => tags.has(tool.tag.toLowerCase()));
+	const mode = RAW_MODE === "minimal" ? "minimal" : "db";
+	return upstreamDokployTools.filter((tool) => isRawToolAllowed(tool, mode));
+}
+
+function isRawToolAllowed(tool, mode) {
+	const normalizedName = tool.name.replace(/-/g, "_");
+	const tag = tool.tag.toLowerCase();
+	const path = tool.path.toLowerCase();
+	const method = tool.method.toUpperCase();
+
+	if (RAW_MINIMAL_TOOL_NAMES.has(normalizedName)) return true;
+	if (mode === "db" && RAW_DATABASE_TAGS.has(tag)) return true;
+
+	if (RAW_BLOCKED_TAGS.has(tag)) return false;
+	if (RAW_BLOCKED_NAME_PATTERNS.some((pattern) => pattern.test(normalizedName))) return false;
+
+	if (method === "GET" && RAW_QUERY_TAGS.has(tag)) return true;
+	if (method === "GET" && path.includes("readlogs")) return true;
+	if (method === "GET" && path.includes("readtraefik")) return true;
+
+	return false;
 }
 
 function toDraft2020_12JsonSchema(schema) {
