@@ -60,7 +60,7 @@ For projects that need Dokploy-managed databases, use the safe database tools in
 - `dokploy_create_redis`
 - `dokploy_create_libsql`
 
-The create tools call the corresponding Dokploy database API and can deploy the resource after creation. If a password is omitted, the MCP generates one for Dokploy but does not return it in the MCP response. If an app only defines `postgres`, `mysql`, or similar services inside its own `docker-compose.yml`, these database tools are not required.
+The create tools call the corresponding Dokploy database API and can deploy the resource after creation. If a password is omitted, the MCP generates one for Dokploy and returns it once in `oneTimeCredentials`, so the app can be configured immediately. If an app only defines `postgres`, `mysql`, or similar services inside its own `docker-compose.yml`, these database tools are not required.
 
 ## Local Project Uploads
 
@@ -198,7 +198,9 @@ After configuration, remind me to fully restart Codex.
 
 After restart:
 - Check Dokploy connectivity with dokploy_connection_check.
-- For deployments, use dokploy_deploy_from_local_archive first.
+- For simple static pages, use dokploy_deploy_static_page.
+- For local app/project directories, use dokploy_deploy_from_local_archive.
+- For existing compose/application routes, use dokploy_publish_route.
 - For status checks, use dokploy_get_project_status.
 - For deletion or cleanup, use dokploy_delete_project or dokploy_cleanup_failed_deploy.
 - Use raw_* tools only for administrator troubleshooting.

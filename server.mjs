@@ -203,16 +203,26 @@ server.tool(
 		ok: true,
 		message: "Use dokploy_safe as the preferred entry point for deployment and route publishing.",
 		preferredTools: [
-			"dokploy_deploy_from_local_archive",
 			"dokploy_deploy_static_page",
+			"dokploy_deploy_from_local_archive",
 			"dokploy_publish_route",
 			"dokploy_unpublish_route",
 			"dokploy_get_project_status",
+			"dokploy_database_search",
 			"dokploy_create_postgres",
 			"dokploy_create_mysql",
+			"dokploy_create_mariadb",
+			"dokploy_create_mongo",
 			"dokploy_create_redis",
+			"dokploy_create_libsql",
 			"dokploy_delete_project",
 			"dokploy_cleanup_failed_deploy",
+		],
+		workflowHints: [
+			"For a simple static page, call dokploy_deploy_static_page.",
+			"For a local app or project directory, call dokploy_deploy_from_local_archive.",
+			"For an existing compose/application, call dokploy_publish_route.",
+			"For Dokploy-native databases, use the safe database tools rather than raw database tools.",
 		],
 		rawDokployUseCases: [
 			"Use raw_* tools only for advanced upstream Dokploy API operations not wrapped by safe tools.",
@@ -512,7 +522,7 @@ server.tool(
 	[
 		"Create a Dokploy-native Postgres database safely.",
 		"Use this when a new project needs managed Postgres without exposing the full raw database tool set.",
-		"The returned result omits passwords.",
+		"If a password is generated, it is returned once as oneTimeCredentials so the app can be configured.",
 	].join(" "),
 	{
 		environmentId: z.string(),
@@ -534,7 +544,7 @@ server.tool(
 	[
 		"Create a Dokploy-native MySQL database safely.",
 		"Use this when a new project needs managed MySQL without exposing the full raw database tool set.",
-		"The returned result omits passwords.",
+		"If a password is generated, it is returned once as oneTimeCredentials so the app can be configured.",
 	].join(" "),
 	{
 		environmentId: z.string(),
@@ -557,7 +567,7 @@ server.tool(
 	[
 		"Create a Dokploy-native MariaDB database safely.",
 		"Use this when a new project needs managed MariaDB without exposing the full raw database tool set.",
-		"The returned result omits passwords.",
+		"If a password is generated, it is returned once as oneTimeCredentials so the app can be configured.",
 	].join(" "),
 	{
 		environmentId: z.string(),
@@ -580,7 +590,7 @@ server.tool(
 	[
 		"Create a Dokploy-native MongoDB database safely.",
 		"Use this when a new project needs managed MongoDB without exposing the full raw database tool set.",
-		"The returned result omits passwords.",
+		"If a password is generated, it is returned once as oneTimeCredentials so the app can be configured.",
 	].join(" "),
 	{
 		environmentId: z.string(),
@@ -602,7 +612,7 @@ server.tool(
 	[
 		"Create a Dokploy-native Redis database safely.",
 		"Use this when a new project needs managed Redis without exposing the full raw database tool set.",
-		"The returned result omits passwords.",
+		"If a password is generated, it is returned once as oneTimeCredentials so the app can be configured.",
 	].join(" "),
 	{
 		environmentId: z.string(),
@@ -622,7 +632,7 @@ server.tool(
 	[
 		"Create a Dokploy-native LibSQL database safely.",
 		"Use this when a new project needs managed LibSQL without exposing the full raw database tool set.",
-		"The returned result omits passwords.",
+		"If a password is generated, it is returned once as oneTimeCredentials so the app can be configured.",
 	].join(" "),
 	{
 		environmentId: z.string(),
@@ -1150,11 +1160,11 @@ async function getProjectStatus(projectIdOrName, options = {}) {
 	}
 	return {
 		ok: true,
-		project,
-		environments,
-		compose,
-		applications,
-		deployments,
+		project: redactSafeStatus(project),
+		environments: redactSafeStatus(environments),
+		compose: redactSafeStatus(compose),
+		applications: redactSafeStatus(applications),
+		deployments: redactSafeStatus(deployments),
 		routes,
 		routeChecks,
 	};
@@ -1475,7 +1485,9 @@ async function createManagedDatabase(typeInput, input) {
 
 	const type = normalizeDatabaseType(typeInput);
 	const payload = buildManagedDatabasePayload(type, input);
-	const created = await dokploy("POST", `/${type}.create`, payload);
+	const oneTimeCredentials = managedDatabaseOneTimeCredentials(type, payload);
+	const apiPayload = stripInternalPayload(payload);
+	const created = await dokploy("POST", `/${type}.create`, apiPayload);
 	const idField = databaseIdField(type);
 	const id = findDatabaseId(created, type);
 	const steps = [{ step: `${type}.create`, ok: true }];
@@ -1491,14 +1503,15 @@ async function createManagedDatabase(typeInput, input) {
 		type,
 		id,
 		idField,
-		name: payload.name,
-		appName: payload.appName,
-		environmentId: payload.environmentId,
-		databaseName: payload.databaseName,
-		databaseUser: payload.databaseUser,
-		dockerImage: payload.dockerImage,
-		passwordReturned: false,
-		internalConnection: managedDatabaseConnectionHint(type, payload),
+		name: apiPayload.name,
+		appName: apiPayload.appName,
+		environmentId: apiPayload.environmentId,
+		databaseName: apiPayload.databaseName,
+		databaseUser: apiPayload.databaseUser,
+		dockerImage: apiPayload.dockerImage,
+		passwordReturned: Boolean(oneTimeCredentials),
+		oneTimeCredentials,
+		internalConnection: managedDatabaseConnectionHint(type, apiPayload),
 		created: redactDatabaseResult(created, type),
 		deployResult: deployResult ? redactDatabaseResult(deployResult, type) : null,
 		steps,
@@ -1520,31 +1533,44 @@ function buildManagedDatabasePayload(type, input) {
 		payload.databaseName = input.databaseName || "app";
 		payload.databaseUser = input.databaseUser || "app";
 		payload.databasePassword = input.databasePassword || generateSafePassword();
+		payload.__generatedDatabasePassword = !input.databasePassword;
 	}
 
 	if (type === "mysql" || type === "mariadb") {
 		payload.databaseRootPassword = input.databaseRootPassword || generateSafePassword();
+		payload.__generatedDatabaseRootPassword = !input.databaseRootPassword;
 	}
 
 	if (type === "mongo") {
 		payload.databaseUser = input.databaseUser || "app";
 		payload.databasePassword = input.databasePassword || generateSafePassword();
+		payload.__generatedDatabasePassword = !input.databasePassword;
 		if (input.replicaSets !== undefined) payload.replicaSets = input.replicaSets;
 	}
 
 	if (type === "redis") {
 		payload.databasePassword = input.databasePassword || generateSafePassword();
+		payload.__generatedDatabasePassword = !input.databasePassword;
 	}
 
 	if (type === "libsql") {
 		payload.databaseUser = input.databaseUser || "app";
 		payload.databasePassword = input.databasePassword || generateSafePassword();
+		payload.__generatedDatabasePassword = !input.databasePassword;
 		payload.sqldNode = input.sqldNode || "primary";
 		payload.sqldPrimaryUrl = input.sqldPrimaryUrl ?? null;
 		payload.enableNamespaces = input.enableNamespaces || false;
 	}
 
 	return payload;
+}
+
+function stripInternalPayload(payload) {
+	const clean = { ...payload };
+	for (const key of Object.keys(clean)) {
+		if (key.startsWith("__")) delete clean[key];
+	}
+	return clean;
 }
 
 function normalizeDatabaseType(type) {
@@ -1631,6 +1657,53 @@ function managedDatabaseConnectionHint(type, payload) {
 	return { host };
 }
 
+function managedDatabaseOneTimeCredentials(type, payload) {
+	if (!payload.__generatedDatabasePassword && !payload.__generatedDatabaseRootPassword) {
+		return null;
+	}
+
+	const host = payload.appName || payload.name;
+	const credentials = {
+		note: "Store these now if you need them. They are generated by dokploy-safe-mcp and returned only in this create response.",
+		host,
+	};
+
+	if (payload.__generatedDatabasePassword) {
+		credentials.password = payload.databasePassword;
+	}
+	if (payload.__generatedDatabaseRootPassword) {
+		credentials.rootPassword = payload.databaseRootPassword;
+	}
+
+	if (type === "postgres") {
+		credentials.port = 5432;
+		credentials.database = payload.databaseName;
+		credentials.user = payload.databaseUser;
+		credentials.url = `postgresql://${payload.databaseUser}:${payload.databasePassword}@${host}:5432/${payload.databaseName}`;
+	}
+	if (type === "mysql" || type === "mariadb") {
+		credentials.port = 3306;
+		credentials.database = payload.databaseName;
+		credentials.user = payload.databaseUser;
+		credentials.url = `mysql://${payload.databaseUser}:${payload.databasePassword}@${host}:3306/${payload.databaseName}`;
+	}
+	if (type === "mongo") {
+		credentials.port = 27017;
+		credentials.user = payload.databaseUser;
+		credentials.url = `mongodb://${payload.databaseUser}:${payload.databasePassword}@${host}:27017`;
+	}
+	if (type === "redis") {
+		credentials.port = 6379;
+		credentials.url = `redis://:${payload.databasePassword}@${host}:6379`;
+	}
+	if (type === "libsql") {
+		credentials.port = 8080;
+		credentials.user = payload.databaseUser;
+	}
+
+	return credentials;
+}
+
 function redactDatabaseResult(value, type) {
 	return deepRedact(value, [
 		"password",
@@ -1644,6 +1717,23 @@ function redactDatabaseResult(value, type) {
 		"MONGO_INITDB_ROOT_PASSWORD",
 		"REDIS_PASSWORD",
 		`${type?.toUpperCase?.() || "DATABASE"}_PASSWORD`,
+	]);
+}
+
+function redactSafeStatus(value) {
+	return deepRedact(value, [
+		"env",
+		"composeFile",
+		"refreshToken",
+		"token",
+		"apiKey",
+		"password",
+		"secret",
+		"databasePassword",
+		"databaseRootPassword",
+		"ADMIN_PASSWORD",
+		"OPENAI_API_KEY",
+		"DIFY_API_KEY",
 	]);
 }
 
