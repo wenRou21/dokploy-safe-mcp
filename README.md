@@ -13,6 +13,7 @@ Core safe tools:
 - `dokploy_unpublish_route`
 - `dokploy_prepare_upload_slot`
 - `dokploy_deploy_from_local_archive`
+- `dokploy_replace_project_from_local_archive`
 - `dokploy_get_project_status`
 - `dokploy_database_search`
 - `dokploy_create_postgres`
@@ -45,6 +46,8 @@ For clients that need a specific upstream subset, `DOKPLOY_ENABLED_TAGS` can sti
 
 The safe deployment tools always use the public entry `http://183.196.108.32:18080`, publish/remove routes through `/join/routes`, and verify the final public URL state. `dokploy_deploy_static_page` uses the same upload gateway as `dokploy_deploy_from_local_archive` in static mode, which is the preferred path for simple static pages.
 
+For changes to an already deployed user project, prefer `dokploy_replace_project_from_local_archive`. It validates the new local source first, deletes the old project and managed route, deploys a fresh project, republishes the same path, and verifies the public URL. Do not patch normal projects in place with `compose.update`, `application.deploy`, `compose.deploy`, or raw write tools unless doing administrator troubleshooting.
+
 ## Dokploy-Native Databases
 
 For projects that need Dokploy-managed databases, use the safe database tools instead of enabling all raw database tools:
@@ -68,6 +71,7 @@ For real projects that are too large to embed into MCP JSON, use:
 
 - `dokploy_prepare_upload_slot`: returns the configured HTTP upload gateway and size limit.
 - `dokploy_deploy_from_local_archive`: accepts a local directory or archive, uploads it to the Dokploy host over HTTP multipart, creates a raw Dokploy compose, deploys it, publishes a `/join/routes` path, and verifies HTTP 200.
+- `dokploy_replace_project_from_local_archive`: for modifying an existing deployed project, deletes the old project and redeploys the new archive/directory to the same path.
 
 The upload gateway accepts the archive and returns a deployment task immediately; the MCP then polls the task status until the server-side Dokploy deployment and public URL verification finish. This avoids long-lived upload HTTP requests during large builds.
 
@@ -200,6 +204,7 @@ After restart:
 - Check Dokploy connectivity with dokploy_connection_check.
 - For simple static pages, use dokploy_deploy_static_page.
 - For local app/project directories, use dokploy_deploy_from_local_archive.
+- For modifying an already deployed project, use dokploy_replace_project_from_local_archive instead of patching the existing compose/application in place.
 - For existing compose/application routes, use dokploy_publish_route.
 - For status checks, use dokploy_get_project_status.
 - For deletion or cleanup, use dokploy_delete_project or dokploy_cleanup_failed_deploy.

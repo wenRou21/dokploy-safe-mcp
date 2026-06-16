@@ -181,6 +181,8 @@ const server = new McpServer({
 		"This server is the single preferred MCP entry point for Dokploy on this host.",
 		"It includes safe deployment/route publishing tools plus common Dokploy inspection and management tools.",
 		"Before deploying to Dokploy or publishing a public path, use dokploy_deploy_static_page or dokploy_publish_route.",
+		"When modifying an already deployed project, prefer dokploy_replace_project_from_local_archive: validate the new local source, delete the old project, redeploy a fresh project, then republish and verify the path.",
+		"Do not patch normal user projects with compose.update or raw write tools unless doing administrator troubleshooting.",
 		"By default it exposes only selected raw_* Dokploy tools for troubleshooting. Use safe database tools for Dokploy-native databases.",
 		"Set DOKPLOY_SAFE_RAW_MODE=full only for temporary administrator troubleshooting.",
 		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
@@ -205,6 +207,7 @@ server.tool(
 		preferredTools: [
 			"dokploy_deploy_static_page",
 			"dokploy_deploy_from_local_archive",
+			"dokploy_replace_project_from_local_archive",
 			"dokploy_publish_route",
 			"dokploy_unpublish_route",
 			"dokploy_get_project_status",
@@ -221,6 +224,7 @@ server.tool(
 		workflowHints: [
 			"For a simple static page, call dokploy_deploy_static_page.",
 			"For a local app or project directory, call dokploy_deploy_from_local_archive.",
+			"For changes to an already deployed project, call dokploy_replace_project_from_local_archive instead of patching the existing compose/application.",
 			"For an existing compose/application, call dokploy_publish_route.",
 			"For Dokploy-native databases, use the safe database tools rather than raw database tools.",
 		],
@@ -234,7 +238,7 @@ server.tool(
 if (RAW_MODE === "full") {
 	server.tool(
 		"dokploy_raw_api",
-		"Advanced escape hatch for any Dokploy OpenAPI endpoint. Prefer named safe tools for deployment and route publishing. Use method GET or POST and a path such as /project.all or /compose.update.",
+		"Advanced escape hatch for any Dokploy OpenAPI endpoint. Prefer named safe tools for deployment and route publishing. For normal project changes, use dokploy_replace_project_from_local_archive instead of patching existing deployments with raw write APIs. Use method GET or POST and a path such as /project.all or /compose.update.",
 		{
 			method: z.enum(["GET", "POST"]),
 			path: z.string().describe("Dokploy API path, for example /project.all or /compose.update."),
@@ -347,7 +351,7 @@ server.tool(
 
 server.tool(
 	"dokploy_application_deploy",
-	"Deploy an existing Dokploy application. After deploying, use dokploy_publish_route to publish/verify the public path.",
+	"Deploy an existing Dokploy application. For normal user-facing project changes, prefer dokploy_replace_project_from_local_archive so the project is deleted and redeployed cleanly. Use this mainly for troubleshooting or intentional application redeploys, then use dokploy_publish_route to publish/verify the public path.",
 	{
 		applicationId: z.string(),
 		title: z.string().optional(),
@@ -417,7 +421,7 @@ server.tool(
 
 server.tool(
 	"dokploy_compose_update",
-	"Update a Dokploy compose. For raw compose deployments, set sourceType=raw and composeType=docker-compose to avoid accidental GitHub source resolution.",
+	"Update a Dokploy compose. Advanced troubleshooting only: for normal project changes, prefer dokploy_replace_project_from_local_archive so the old project is deleted and a fresh project is deployed. If you intentionally update a raw compose, set sourceType=raw and composeType=docker-compose to avoid accidental GitHub source resolution.",
 	{
 		composeId: z.string(),
 		name: z.string().optional(),
@@ -435,7 +439,7 @@ server.tool(
 
 server.tool(
 	"dokploy_compose_deploy",
-	"Deploy an existing Dokploy compose. After deploying, use dokploy_publish_route to publish/verify the public path.",
+	"Deploy an existing Dokploy compose. For normal user-facing project changes, prefer dokploy_replace_project_from_local_archive so the project is deleted and redeployed cleanly. Use this mainly for troubleshooting or intentional compose redeploys, then use dokploy_publish_route to publish/verify the public path.",
 	{
 		composeId: z.string(),
 		title: z.string().optional(),
@@ -759,6 +763,7 @@ server.tool(
 		"Deploy a local archive or directory by uploading it to the Dokploy host over HTTP multipart first.",
 		"This avoids embedding large source code blobs into MCP JSON or docker-compose.",
 		"Modes: auto, static, dockerfile, and railpack. The server creates a Dokploy raw compose, deploys it, publishes through /join/routes, and verifies the public URL.",
+		"For changes to an already deployed project, prefer dokploy_replace_project_from_local_archive so the old project is deleted before a fresh deployment uses the same public path.",
 	].join(" "),
 	{
 		sourcePath: z.string().describe("Local path on the machine running Codex/MCP. Can be a directory, .zip, .tar, .tar.gz, or .tgz."),
@@ -771,6 +776,29 @@ server.tool(
 	},
 	async (input) => {
 		const result = await deployFromLocalArchive(input);
+		return jsonToolResult(result);
+	},
+);
+
+server.tool(
+	"dokploy_replace_project_from_local_archive",
+	[
+		"Preferred tool for modifying an already deployed project from a local directory or archive.",
+		"It validates the new local source first, resolves the old project/path, deletes the old project and managed route, uploads a fresh deployment, republishes the path, and verifies the public URL.",
+		"Use this instead of patching existing compose/application settings when a user asks to change, update, edit, rebuild, or republish an existing project.",
+	].join(" "),
+	{
+		sourcePath: z.string().describe("Local path on the machine running Codex/MCP. Can be a directory, .zip, .tar, .tar.gz, or .tgz. This is checked before deleting the old project."),
+		projectIdOrName: z.string().optional().describe("Old project ID or exact/unique old project name. Provide this or path."),
+		path: z.string().optional().describe("Public path to replace, for example /my-site. Defaults to the old project's only managed route when projectIdOrName is provided."),
+		name: z.string().optional().describe("Base name for the new project. Defaults to the old project name, source path name, or a generated name."),
+		mode: z.enum(["auto", "static", "dockerfile", "railpack"]).default("auto"),
+		port: z.number().int().positive().default(80).describe("Internal container port to publish."),
+		env: z.record(z.string()).default({}).describe("Environment variables for generated dockerfile/static compose modes."),
+		verifyTimeoutMs: z.number().int().positive().optional().describe("Deployment and public URL verification timeout in milliseconds."),
+	},
+	async (input) => {
+		const result = await replaceProjectFromLocalArchive(input);
 		return jsonToolResult(result);
 	},
 );
@@ -851,6 +879,15 @@ async function prepareUploadSlot(name) {
 
 async function deployFromLocalArchive(input) {
 	assertConfigured();
+	const prepared = await prepareLocalArchiveDeployment(input);
+	try {
+		return uploadPreparedLocalArchive(prepared);
+	} finally {
+		await cleanupLocalPayload(prepared.localPayload);
+	}
+}
+
+async function prepareLocalArchiveDeployment(input) {
 	const localSource = path.resolve(String(input.sourcePath || ""));
 	const sourceStat = await fs.stat(localSource);
 	const stamp = timestampSlug();
@@ -865,21 +902,129 @@ async function deployFromLocalArchive(input) {
 		throw new Error(`Upload payload is ${payloadStat.size} bytes, above DOKPLOY_UPLOAD_MAX_MB limit (${UPLOAD_MAX_BYTES} bytes).`);
 	}
 
-	try {
-		return uploadAndDeploy({
-			localPayload,
-			name: baseName,
-			path: publicPath,
-			mode: input.mode || "auto",
-			port: input.port || 80,
-			env: input.env || {},
-			verifyTimeoutMs: input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS,
-		});
-	} finally {
-		if (localPayload.cleanup) {
-			await fs.rm(localPayload.path, { force: true }).catch(() => undefined);
-		}
+	return {
+		localSource,
+		sourceStat,
+		localPayload,
+		name: baseName,
+		path: publicPath,
+		mode: input.mode || "auto",
+		port: input.port || 80,
+		env: input.env || {},
+		verifyTimeoutMs: input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS,
+	};
+}
+
+async function uploadPreparedLocalArchive(prepared) {
+	return uploadAndDeploy({
+		localPayload: prepared.localPayload,
+		name: prepared.name,
+		path: prepared.path,
+		mode: prepared.mode,
+		port: prepared.port,
+		env: prepared.env,
+		verifyTimeoutMs: prepared.verifyTimeoutMs,
+	});
+}
+
+async function cleanupLocalPayload(localPayload) {
+	if (localPayload?.cleanup) {
+		await fs.rm(localPayload.path, { force: true }).catch(() => undefined);
 	}
+}
+
+async function replaceProjectFromLocalArchive(input) {
+	assertConfigured();
+	const startedAt = new Date().toISOString();
+	const oldTarget = await resolveReplaceTarget(input);
+	const replacementPath = normalizePath(input.path || oldTarget.path);
+	validatePath(replacementPath);
+	const prepared = await prepareLocalArchiveDeployment({
+		sourcePath: input.sourcePath,
+		name: input.name || replacementBaseName(replacementPath),
+		path: replacementPath,
+		mode: input.mode || "auto",
+		port: input.port || 80,
+		env: input.env || {},
+		verifyTimeoutMs: input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS,
+	});
+	const replacementName = prepared.name;
+
+	const steps = [{
+		step: "preflight_source",
+		ok: true,
+		sourcePath: prepared.localSource,
+		isDirectory: prepared.sourceStat.isDirectory(),
+		payloadPath: prepared.localPayload.path,
+		payloadKind: prepared.localPayload.kind,
+	}];
+
+	let deleted = null;
+	let deployed = null;
+
+	try {
+		deleted = await deleteProject({
+			projectIdOrName: oldTarget.projectIdOrName,
+			deleteRoutes: true,
+			cleanupContainers: true,
+			verifyTimeoutMs: input.verifyTimeoutMs,
+		});
+		steps.push({ step: "delete_old_project", ok: true, projectIdOrName: oldTarget.projectIdOrName, result: deleted });
+	} catch (error) {
+		steps.push({ step: "delete_old_project", ok: false, projectIdOrName: oldTarget.projectIdOrName, error: error.message });
+		throw new Error(`Replacement stopped before new deployment because old project deletion failed: ${error.message}`);
+	}
+
+	try {
+		deployed = await uploadPreparedLocalArchive(prepared);
+		steps.push({ step: "deploy_replacement", ok: true, path: replacementPath, result: deployed });
+	} catch (error) {
+		steps.push({ step: "deploy_replacement", ok: false, path: replacementPath, error: error.message });
+		return {
+			ok: false,
+			message: "Old project was deleted, but replacement deployment failed. Fix the source or deployment error and run dokploy_deploy_from_local_archive with the same path to restore service.",
+			startedAt,
+			completedAt: new Date().toISOString(),
+			oldTarget,
+			path: replacementPath,
+			name: replacementName,
+			steps,
+			deleteProject: deleted,
+			error: error.message,
+			recommendedNextAction: {
+				tool: "dokploy_deploy_from_local_archive",
+				reason: "The old project is already deleted; deploy the fixed source to the same path.",
+				args: {
+					sourcePath: prepared.localSource,
+					name: replacementName,
+					path: replacementPath,
+					mode: input.mode || "auto",
+					port: input.port || 80,
+				},
+			},
+			rulesApplied: platformRules(),
+		};
+	} finally {
+		await cleanupLocalPayload(prepared.localPayload);
+	}
+
+	return {
+		ok: true,
+		message: "Project replaced by deleting the old project, deploying a fresh project, publishing the path, and verifying the public URL.",
+		startedAt,
+		completedAt: new Date().toISOString(),
+		oldTarget,
+		path: replacementPath,
+		name: replacementName,
+		steps,
+		deleteProject: deleted,
+		deployment: deployed,
+		recommendedNextAction: {
+			tool: "dokploy_replace_project_from_local_archive",
+			reason: "Use this same replacement workflow for future changes to this project/path.",
+		},
+		rulesApplied: platformRules(),
+	};
 }
 
 async function uploadAndDeploy(input) {
@@ -937,7 +1082,7 @@ async function waitForUploadDeploymentTask(initial, timeoutMs) {
 				throw new Error(`Upload deployment failed: ${data.message || JSON.stringify(data)}`);
 			}
 		} catch (error) {
-			if (!isNetworkError(error)) {
+			if (!isUploadStatusRetryableError(error)) {
 				throw error;
 			}
 			last = { statusPollError: error.message };
@@ -1167,6 +1312,67 @@ async function getProjectStatus(projectIdOrName, options = {}) {
 		deployments: redactSafeStatus(deployments),
 		routes,
 		routeChecks,
+		recommendedNextAction: {
+			when: "If the user wants to modify, update, edit, rebuild, or republish this project.",
+			tool: "dokploy_replace_project_from_local_archive",
+			reason: "Normal project changes should delete the old project and deploy a fresh replacement rather than patching compose/application settings in place.",
+			argsHint: {
+				projectIdOrName: projectId,
+				path: routes.length === 1 ? routes[0].path : "Provide the path to replace when there are zero or multiple managed routes.",
+				sourcePath: "Local directory or archive containing the new version.",
+			},
+		},
+	};
+}
+
+async function resolveReplaceTarget(input) {
+	const hasProject = Boolean(String(input.projectIdOrName || "").trim());
+	const hasPath = Boolean(String(input.path || "").trim());
+	if (!hasProject && !hasPath) {
+		throw new Error("Provide projectIdOrName or path to identify the existing project to replace.");
+	}
+
+	if (hasProject) {
+		const status = await getProjectStatus(input.projectIdOrName, { verifyRoutes: false });
+		const projectId = status.project.projectId || status.project.id;
+		let selectedPath = input.path ? normalizePath(input.path) : "";
+		if (!selectedPath) {
+			if (status.routes.length !== 1) {
+				throw new Error(`Project has ${status.routes.length} managed routes; provide path explicitly so the replacement uses the intended public URL.`);
+			}
+			selectedPath = status.routes[0].path;
+		}
+		const routeMatchesProject = status.routes.some((route) => route.path === selectedPath);
+		if (status.routes.length > 0 && !routeMatchesProject) {
+			throw new Error(`Path ${selectedPath} is not one of the managed routes for project ${projectId}.`);
+		}
+		return {
+			projectIdOrName: projectId,
+			project: status.project,
+			path: selectedPath,
+			routes: status.routes,
+			resolvedBy: "project",
+		};
+	}
+
+	const selectedPath = normalizePath(input.path);
+	const route = (await managedRoutesForTargets({ paths: [selectedPath] }))[0];
+	if (!route?.ownerId) {
+		throw new Error(`No managed route with an owner was found for ${selectedPath}; provide projectIdOrName instead.`);
+	}
+
+	const projectId = await projectIdForRouteOwner(route.ownerId);
+	if (!projectId) {
+		throw new Error(`Could not resolve project for route ${selectedPath}; provide projectIdOrName instead.`);
+	}
+	const status = await getProjectStatus(projectId, { verifyRoutes: false });
+	return {
+		projectIdOrName: projectId,
+		project: status.project,
+		path: selectedPath,
+		routes: status.routes,
+		route,
+		resolvedBy: "path",
 	};
 }
 
@@ -1761,6 +1967,13 @@ function isNetworkError(error) {
 		|| message.includes("UND_ERR");
 }
 
+function isUploadStatusRetryableError(error) {
+	const message = error?.message || "";
+	return isNetworkError(error)
+		|| message.includes("Upload deployment status failed: HTTP 500")
+		|| message.includes("Remote end closed connection without response");
+}
+
 async function resolveProject(projectIdOrName) {
 	const needle = String(projectIdOrName || "").trim();
 	if (!needle) throw new Error("projectIdOrName is required.");
@@ -1815,6 +2028,23 @@ async function projectIdForEnvironment(environmentId) {
 		}
 	}
 	return null;
+}
+
+async function projectIdForRouteOwner(ownerId) {
+	if (!ownerId) return null;
+	const compose = await tryDokploy("GET", "/compose.one", { composeId: ownerId });
+	let projectId = compose?.projectId || compose?.project?.projectId || compose?.project?.id;
+	if (!projectId && compose?.environmentId) {
+		projectId = await projectIdForEnvironment(compose.environmentId);
+	}
+	if (projectId) return projectId;
+
+	const application = await tryDokploy("GET", "/application.one", { applicationId: ownerId });
+	projectId = application?.projectId || application?.project?.projectId || application?.project?.id;
+	if (!projectId && application?.environmentId) {
+		projectId = await projectIdForEnvironment(application.environmentId);
+	}
+	return projectId || null;
 }
 
 function rowsOf(value) {
@@ -2047,7 +2277,7 @@ function registerUpstreamDokployTools(mcpServer) {
 			name,
 			[
 				`Upstream Dokploy MCP tool: ${tool.description}.`,
-				"Advanced raw operation. For deployment and public routes on this host, prefer dokploy_deploy_static_page or dokploy_publish_route.",
+				"Advanced raw operation. For normal project changes, prefer dokploy_replace_project_from_local_archive so the old project is deleted and a fresh project is deployed. For new deployments and public routes, prefer dokploy_deploy_static_page, dokploy_deploy_from_local_archive, or dokploy_publish_route.",
 			].join(" "),
 			tool.schema.shape,
 			tool.annotations ?? {},
@@ -2395,6 +2625,10 @@ function sanitizeAppName(name) {
 	return safe || `dokploy-safe-${timestampSlug()}`;
 }
 
+function replacementBaseName(publicPath) {
+	return sanitizeName(`replace-${publicPath.slice(1)}`).slice(0, 28);
+}
+
 function generateSafePassword(length = 32) {
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 	let result = "";
@@ -2539,6 +2773,8 @@ function platformRules() {
 	return [
 		"Use http://183.196.108.32:18080 as the public HTTP entry; do not assume 80/443.",
 		"Use a unique path prefix for each project.",
+		"When modifying an already deployed project, prefer deleting the old project and redeploying a fresh replacement with dokploy_replace_project_from_local_archive.",
+		"Do not patch normal user projects in place with compose.update, application.deploy, compose.deploy, or raw write tools unless doing administrator troubleshooting.",
 		"Member API keys do not write Traefik directly; traefikFiles.write=false is normal.",
 		"Publish routes through POST /join/routes.",
 		"/join/routes creates Host(183.196.108.32) && PathPrefix(/xxx) and defaults stripPrefix.",
