@@ -15,6 +15,11 @@ Core safe tools:
 - `dokploy_deploy_from_local_archive`
 - `dokploy_replace_project_from_local_archive`
 - `dokploy_get_project_status`
+- `dokploy_check_traefik_route`
+- `dokploy_check_public_url`
+- `dokploy_check_container_health`
+- `dokploy_diagnose_route`
+- `dokploy_get_last_deploy_summary`
 - `dokploy_database_search`
 - `dokploy_create_postgres`
 - `dokploy_create_mysql`
@@ -75,6 +80,8 @@ For real projects that are too large to embed into MCP JSON, use:
 
 The upload gateway accepts the archive and returns a deployment task immediately; the MCP then polls the task status until the server-side Dokploy deployment and public URL verification finish. This avoids long-lived upload HTTP requests during large builds.
 
+Before uploading or creating new Dokploy objects, new-project deployment tools run a local preflight check for public path conflicts, project/compose/app name conflicts, existing containers, and archive readability. Path checks follow Traefik `PathPrefix` behavior, so `/foo` conflicts with `/foo/bar`. Replacement deployments keep using `dokploy_replace_project_from_local_archive`, which validates the new source first and then removes the old route/project before deploying to the same path.
+
 Supported `dokploy_deploy_from_local_archive` modes:
 
 - `static`: serve uploaded static files through `nginx:alpine`.
@@ -102,6 +109,11 @@ When testing on the Dokploy host itself, operators can point `DOKPLOY_URL`, `DOK
 Use the high-level tools before raw API calls:
 
 - `dokploy_get_project_status`: inspect one project, related compose apps, deployments, managed routes, and route checks.
+- `dokploy_diagnose_route`: one-shot route diagnosis for Traefik route metadata, public URL state, owner object, and container health.
+- `dokploy_check_traefik_route`: inspect managed route metadata and path-prefix conflicts.
+- `dokploy_check_public_url`: check a public URL or path.
+- `dokploy_check_container_health`: inspect containers by Dokploy appName.
+- `dokploy_get_last_deploy_summary`: summarize the latest visible deployment state or a specific project/path.
 - `dokploy_delete_project`: delete one visible project by exact ID or unique name, remove its managed routes, and clean up leftover containers.
 - `dokploy_cleanup_failed_deploy`: clean up failed or partial deployments by project, compose, or route path.
 

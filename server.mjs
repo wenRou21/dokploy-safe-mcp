@@ -211,6 +211,11 @@ server.tool(
 			"dokploy_publish_route",
 			"dokploy_unpublish_route",
 			"dokploy_get_project_status",
+			"dokploy_check_traefik_route",
+			"dokploy_check_public_url",
+			"dokploy_check_container_health",
+			"dokploy_diagnose_route",
+			"dokploy_get_last_deploy_summary",
 			"dokploy_database_search",
 			"dokploy_create_postgres",
 			"dokploy_create_mysql",
@@ -711,6 +716,54 @@ server.tool(
 );
 
 server.tool(
+	"dokploy_check_traefik_route",
+	"Read-only diagnosis for managed Traefik routes. Checks path-prefix overlap and owner metadata without writing files.",
+	{
+		path: z.string().optional().describe("Public path prefix, for example /my-site."),
+		ownerId: z.string().optional().describe("Compose/application owner ID recorded by route-manager."),
+	},
+	async (input) => jsonToolResult(await checkTraefikRoute(input)),
+);
+
+server.tool(
+	"dokploy_check_public_url",
+	"Read-only HTTP check for a public URL or public path on this Dokploy host.",
+	{
+		url: z.string().url().optional(),
+		path: z.string().optional().describe("Public path prefix, for example /my-site."),
+	},
+	async (input) => jsonToolResult(await checkPublicUrl(input)),
+);
+
+server.tool(
+	"dokploy_check_container_health",
+	"Read-only container health check by Dokploy appName.",
+	{
+		appName: z.string().describe("Dokploy appName or compose appName."),
+	},
+	async (input) => jsonToolResult(await checkContainerHealth(input.appName)),
+);
+
+server.tool(
+	"dokploy_diagnose_route",
+	"One-shot diagnosis for a public route: Traefik route metadata, public URL state, owner object, and container health.",
+	{
+		path: z.string().describe("Public path prefix, for example /my-site."),
+	},
+	async (input) => jsonToolResult(await diagnoseRoute(input.path)),
+);
+
+server.tool(
+	"dokploy_get_last_deploy_summary",
+	"Summarize the latest visible deployment state, or diagnose a specific project/path.",
+	{
+		projectIdOrName: z.string().optional(),
+		path: z.string().optional(),
+	},
+	async (input) => jsonToolResult(await getLastDeploySummary(input)),
+);
+
+server.tool(
 	"dokploy_delete_project",
 	[
 		"Delete one visible Dokploy project by exact ID or unique name, plus its managed public routes.",
@@ -892,11 +945,10 @@ async function prepareLocalArchiveDeployment(input) {
 	const sourceStat = await fs.stat(localSource);
 	const stamp = timestampSlug();
 	const baseName = sanitizeName(input.name || path.basename(localSource, path.extname(localSource)) || `archive-${stamp}`);
-	const publicPath = input.path ? normalizePath(input.path) : undefined;
-	if (publicPath) {
-		validatePath(publicPath);
-	}
+	const publicPath = normalizePath(input.path || `/${baseName}`);
+	validatePath(publicPath);
 	const localPayload = await makeLocalPayload(localSource, sourceStat, baseName);
+	await verifyLocalPayload(localPayload);
 	const payloadStat = await fs.stat(localPayload.path);
 	if (payloadStat.size > UPLOAD_MAX_BYTES) {
 		throw new Error(`Upload payload is ${payloadStat.size} bytes, above DOKPLOY_UPLOAD_MAX_MB limit (${UPLOAD_MAX_BYTES} bytes).`);
@@ -912,10 +964,20 @@ async function prepareLocalArchiveDeployment(input) {
 		port: input.port || 80,
 		env: input.env || {},
 		verifyTimeoutMs: input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS,
+		preflight: input.preflight,
 	};
 }
 
 async function uploadPreparedLocalArchive(prepared) {
+	if (prepared.preflight !== false) {
+		await preflightDeploy({
+			path: prepared.path,
+			projectName: prepared.name,
+			composeName: `${prepared.name}-compose`,
+			appName: `${prepared.name}-compose`,
+		});
+	}
+
 	return uploadAndDeploy({
 		localPayload: prepared.localPayload,
 		name: prepared.name,
@@ -947,6 +1009,7 @@ async function replaceProjectFromLocalArchive(input) {
 		port: input.port || 80,
 		env: input.env || {},
 		verifyTimeoutMs: input.verifyTimeoutMs || DEFAULT_TIMEOUT_MS,
+		preflight: false,
 	});
 	const replacementName = prepared.name;
 
@@ -1136,6 +1199,7 @@ async function publishRouteAndVerify(input) {
 
 	const path = normalizePath(input.path);
 	validatePath(path);
+	await assertRoutePathAvailable(path);
 	const hasCompose = Boolean(input.composeId);
 	const hasApplication = Boolean(input.applicationId);
 
@@ -1509,6 +1573,215 @@ function isRouteAlreadyOwnedError(error) {
 	return message.includes("Path is reserved or already owned")
 		|| message.includes("already owned by another route")
 		|| message.includes("reserved");
+}
+
+async function assertRoutePathAvailable(publicPath) {
+	const existing = (await managedRoutesForTargets({ paths: [publicPath], includePrefixConflicts: true }))[0];
+	if (!existing) return;
+
+	throw new Error([
+		`Public path ${publicPath} conflicts with existing route ${existing.path} owned by ${existing.ownerId || "unknown"}.`,
+		"Choose a unique path before uploading; this avoids a full upload/deploy cycle that would fail during route publish.",
+	].join(" "));
+}
+
+async function preflightDeploy({ path, projectName, composeName, appName }) {
+	const issues = [];
+	if (path) {
+		try {
+			validatePath(path);
+			await assertRoutePathAvailable(path);
+		} catch (error) {
+			issues.push(error.message);
+		}
+	}
+
+	if (projectName) {
+		const projects = rowsOf(await tryDokploy("GET", "/project.all"));
+		const existing = projects.find((project) => String(project.name || "") === projectName);
+		if (existing) {
+			issues.push(`Project name ${projectName} already exists (${existing.projectId || existing.id || "unknown id"}).`);
+		}
+	}
+
+	if (composeName || appName) {
+		const compose = await searchComposes({});
+		const existing = compose.find((item) => {
+			const values = [item.name, item.appName].filter(Boolean).map(String);
+			return values.includes(composeName) || values.includes(appName);
+		});
+		if (existing) {
+			issues.push(`Compose/app name already exists: ${composeName || appName} (${existing.composeId || existing.id || "unknown id"}).`);
+		}
+	}
+
+	if (appName) {
+		const health = await checkContainerHealth(appName);
+		if (health.containerCount > 0) {
+			issues.push(`Containers already exist for appName ${appName}: ${health.containers.map((item) => item.name || item.id).filter(Boolean).join(", ")}`);
+		}
+	}
+
+	if (issues.length > 0) {
+		throw new Error(`Preflight failed. Nothing was deployed.\n- ${issues.join("\n- ")}`);
+	}
+}
+
+async function checkTraefikRoute(input = {}) {
+	const queryPath = input.path ? normalizePath(input.path) : null;
+	const routes = parseManagedRoutes(await readTraefikConfig());
+	const matches = routes.filter((route) => {
+		if (queryPath && !pathPrefixConflicts(route.path, queryPath)) return false;
+		if (input.ownerId && route.ownerId !== input.ownerId) return false;
+		return true;
+	});
+
+	return {
+		ok: true,
+		query: {
+			path: queryPath,
+			ownerId: input.ownerId || null,
+		},
+		totalRoutes: routes.length,
+		matches,
+		conflicts: queryPath
+			? matches
+				.filter((route) => pathPrefixConflicts(route.path, queryPath))
+				.map((route) => ({
+					path: route.path,
+					ownerId: route.ownerId,
+					reason: `PathPrefix conflict: requested ${queryPath}, existing ${route.path}`,
+				}))
+			: [],
+	};
+}
+
+async function checkPublicUrl(input = {}) {
+	if (!input.url && !input.path) {
+		throw new Error("Provide url or path.");
+	}
+	const publicPath = input.path ? normalizePath(input.path) : null;
+	const url = input.url || `${PUBLIC_HTTP_URL}${publicPath}`;
+	return {
+		ok: true,
+		url,
+		path: publicPath,
+		check: await quickPublicUrlCheck(url),
+	};
+}
+
+async function checkContainerHealth(appName) {
+	const containers = rowsOf(await tryDokploy("GET", "/docker.getContainersByAppNameMatch", { appName }));
+	const matched = containers.filter((container) => containerMatchesAppName(container, appName));
+	return {
+		ok: matched.length > 0 && matched.some(containerLooksRunning),
+		appName,
+		containerCount: matched.length,
+		containers: matched.map(containerSummary),
+	};
+}
+
+function containerMatchesAppName(container, appName) {
+	const values = [
+		container.name,
+		container.containerName,
+		container.Names?.join?.(" "),
+		container.appName,
+		container.labels?.["com.docker.compose.project"],
+		container.labels?.["com.docker.compose.service"],
+	].filter(Boolean).join(" ");
+	return values.includes(appName);
+}
+
+function containerLooksRunning(container) {
+	const text = [
+		container.status,
+		container.state,
+		container.Status,
+		container.State,
+	].filter(Boolean).join(" ").toLowerCase();
+	return text.includes("running") || text === "healthy";
+}
+
+function containerSummary(container) {
+	return {
+		id: container.containerId || container.id || container.Id,
+		name: container.name || container.containerName || container.Names,
+		image: container.image || container.Image,
+		status: container.status || container.Status || container.state || container.State,
+		health: container.health || container.Health,
+		ports: container.ports || container.Ports,
+		appName: container.appName,
+	};
+}
+
+async function diagnoseRoute(pathValue) {
+	const publicPath = normalizePath(pathValue);
+	validatePath(publicPath);
+	const route = await checkTraefikRoute({ path: publicPath });
+	const exact = route.matches.find((item) => item.path === publicPath) || route.matches[0] || null;
+	const owner = exact?.ownerId ? await resolveRouteOwner(exact.ownerId) : null;
+	const appName = owner?.object?.appName || owner?.object?.name || null;
+	const containers = appName ? await checkContainerHealth(appName) : null;
+
+	return {
+		ok: Boolean(exact) && (!containers || containers.ok),
+		path: publicPath,
+		route,
+		publicUrl: await checkPublicUrl({ path: publicPath }),
+		owner,
+		containers,
+	};
+}
+
+async function getLastDeploySummary(input = {}) {
+	if (input.path) {
+		return diagnoseRoute(input.path);
+	}
+	if (input.projectIdOrName) {
+		return getProjectStatus(input.projectIdOrName, { verifyRoutes: true });
+	}
+
+	const projects = rowsOf(await tryDokploy("GET", "/project.all"));
+	const compose = await searchComposes({});
+	const latestCompose = [...compose].sort((a, b) => Date.parse(b.createdAt || b.created_at || b.updatedAt || b.updated_at || 0) - Date.parse(a.createdAt || a.created_at || a.updatedAt || a.updated_at || 0))[0] || null;
+	const projectId = latestCompose?.projectId || latestCompose?.project?.projectId || latestCompose?.project?.id;
+	const project = projectId
+		? projects.find((item) => [item.projectId, item.id].filter(Boolean).map(String).includes(String(projectId)))
+		: null;
+	return {
+		ok: Boolean(latestCompose),
+		message: latestCompose ? "Latest visible compose summarized from Dokploy state." : "No visible compose found.",
+		project,
+		compose: latestCompose,
+		routes: latestCompose ? await managedRoutesForTargets({ composeIds: [latestCompose.composeId || latestCompose.id] }) : [],
+	};
+}
+
+async function resolveRouteOwner(ownerId) {
+	const compose = await tryDokploy("GET", "/compose.one", { composeId: ownerId });
+	if (compose) {
+		return {
+			kind: "compose",
+			ownerId,
+			object: compose,
+		};
+	}
+
+	const application = await tryDokploy("GET", "/application.one", { applicationId: ownerId });
+	if (application) {
+		return {
+			kind: "application",
+			ownerId,
+			object: application,
+		};
+	}
+
+	return {
+		kind: "unknown",
+		ownerId,
+		object: null,
+	};
 }
 
 function perAttemptTimeout(totalTimeoutMs, attempt) {
@@ -2071,12 +2344,18 @@ function composeAppNames(compose) {
 	return [...new Set(compose.map((item) => item.appName || item.name).filter(Boolean).map(String))];
 }
 
-async function managedRoutesForTargets({ composeIds = [], applicationIds = [], paths = [] }) {
+async function managedRoutesForTargets({ composeIds = [], applicationIds = [], paths = [], includePrefixConflicts = false }) {
 	const targetIds = new Set([...composeIds, ...applicationIds].filter(Boolean).map(String));
 	const targetPaths = new Set(paths.map((item) => normalizePath(item)));
 	const routes = parseManagedRoutes(await readTraefikConfig());
 	return routes.filter((route) => {
-		if (targetPaths.size && targetPaths.has(route.path)) return true;
+		if (targetPaths.size) {
+			for (const targetPath of targetPaths) {
+				if (includePrefixConflicts ? pathPrefixConflicts(route.path, targetPath) : route.path === targetPath) {
+					return true;
+				}
+			}
+		}
 		if (targetIds.size && targetIds.has(route.ownerId)) return true;
 		return false;
 	});
@@ -2100,16 +2379,49 @@ function parseManagedRoutes(config) {
 			ownerId: match[1],
 			path: match[2],
 			kind: match[3],
+			source: "route-manager",
+		});
+	}
+
+	const routerRe = /^ {4}([A-Za-z0-9._-]+):\s*$(?<body>[\s\S]*?)(?=^ {4}[A-Za-z0-9._-]+:\s*$|^ {2}[A-Za-z0-9._-]+:\s*$|$(?![\s\S]))/gm;
+	while ((match = routerRe.exec(text))) {
+		const body = match.groups?.body || "";
+		const rule = body.match(/rule:\s*Host\(`([^`]+)`\)\s*&&\s*PathPrefix\(`(\/[^`]+)`\)/);
+		if (!rule) continue;
+		const service = body.match(/service:\s*([^\s]+)/)?.[1] || "";
+		const existing = routes.find((route) => route.path === rule[2]);
+		if (existing) {
+			existing.host = existing.host || rule[1];
+			existing.router = existing.router || match[1];
+			existing.service = existing.service || service;
+			continue;
+		}
+		routes.push({
+			ownerId: "",
+			path: rule[2],
+			kind: "unknown",
+			host: rule[1],
+			router: match[1],
+			service,
+			source: "traefik-rule",
 		});
 	}
 
 	const prefixRe = /PathPrefix\(`(\/[^`]+)`\)/g;
 	while ((match = prefixRe.exec(text))) {
 		if (!routes.some((route) => route.path === match[1])) {
-			routes.push({ ownerId: "", path: match[1], kind: "unknown" });
+			routes.push({ ownerId: "", path: match[1], kind: "unknown", source: "path-prefix" });
 		}
 	}
 	return routes;
+}
+
+function pathPrefixConflicts(existingPath, requestedPath) {
+	const existing = normalizePath(existingPath);
+	const requested = normalizePath(requestedPath);
+	return existing === requested
+		|| existing.startsWith(`${requested}/`)
+		|| requested.startsWith(`${existing}/`);
 }
 
 async function quickPublicUrlCheck(url) {
@@ -2743,6 +3055,23 @@ async function makeLocalPayload(sourcePath, sourceStat, name) {
 	const item = sourceStat.isDirectory() ? "." : path.basename(sourcePath);
 	await runLocal("tar", ["-czf", archivePath, "-C", cwd, item], 120000);
 	return { path: archivePath, kind: "tgz", extension: "tgz", cleanup: true };
+}
+
+async function verifyLocalPayload(localPayload) {
+	const filename = localPayload.path.toLowerCase();
+	try {
+		if (filename.endsWith(".zip")) {
+			await runLocal("unzip", ["-tq", localPayload.path], 60000);
+			return;
+		}
+
+		if (filename.endsWith(".tar") || filename.endsWith(".tar.gz") || filename.endsWith(".tgz")) {
+			await runLocal("tar", ["-tf", localPayload.path], 60000);
+			return;
+		}
+	} catch (error) {
+		throw new Error(`Local archive validation failed before upload: ${error.message}`);
+	}
 }
 
 function runLocal(command, args, timeoutMs) {
