@@ -11,8 +11,10 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { z } from "zod";
 import { generatedTools as upstreamDokployTools } from "./vendor/dokploy-mcp/generated/tools.js";
 
-const DOKPLOY_URL = trimTrailingSlash(process.env.DOKPLOY_URL || "http://183.196.108.32:18080");
-const PUBLIC_HTTP_URL = trimTrailingSlash(process.env.DOKPLOY_PUBLIC_HTTP_URL || DOKPLOY_URL);
+const DEFAULT_PUBLIC_HTTP_URL = "http://183.196.108.32:18080";
+const DEFAULT_PUBLIC_HOST = "183.196.108.32";
+const DOKPLOY_URL = trimTrailingSlash(process.env.DOKPLOY_URL || DEFAULT_PUBLIC_HTTP_URL);
+const PUBLIC_HTTP_URL = trimTrailingSlash(process.env.DOKPLOY_PUBLIC_HTTP_URL || DEFAULT_PUBLIC_HTTP_URL);
 const API_KEY = process.env.DOKPLOY_API_KEY;
 const DEFAULT_TIMEOUT_MS = Number(process.env.DOKPLOY_SAFE_TIMEOUT_MS || 180000);
 const JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema";
@@ -186,6 +188,7 @@ const server = new McpServer({
 		"By default it exposes only selected raw_* Dokploy tools for troubleshooting. Use safe database tools for Dokploy-native databases.",
 		"Set DOKPLOY_SAFE_RAW_MODE=full only for temporary administrator troubleshooting.",
 		"Do not assume public ports 80/443. The public HTTP entry is http://183.196.108.32:18080.",
+		"Never use a project dev port such as 3000, 5173, or 8787 as the public URL. Those are internal container ports only.",
 		"Member API keys normally cannot write Traefik files directly. Use /join/routes through dokploy_publish_route or dokploy_deploy_static_page.",
 		"New public deployments must use a unique path prefix and verify the final public URL returns 200.",
 	].join(" "),
@@ -270,9 +273,10 @@ server.tool(
 		return jsonToolResult({
 			ok: true,
 			dokployUrl: DOKPLOY_URL,
-			projects,
-			applications,
-			compose,
+			publicHttpUrl: PUBLIC_HTTP_URL,
+			projects: redactSafeStatus(projects),
+			applications: redactSafeStatus(applications),
+			compose: redactSafeStatus(compose),
 		});
 	},
 );
@@ -1238,7 +1242,7 @@ async function publishRouteAndVerify(input) {
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
 			route = await publishRoute(body);
-			url = route.url || `${PUBLIC_HTTP_URL}${path.endsWith("/") ? path : `${path}/`}`;
+			url = publicUrlForPath(path, { trailingSlash: true });
 		} catch (error) {
 			if (!isRouteAlreadyOwnedError(error) || !url) {
 				throw error;
@@ -1315,7 +1319,7 @@ async function unpublishRouteAndVerify(input) {
 	const path = normalizePath(input.path);
 	validatePath(path);
 	const result = await deleteRoute({ apiKey: API_KEY, path });
-	const url = result.url || `${PUBLIC_HTTP_URL}${path}`;
+	const url = publicUrlForPath(path);
 	const verification = await waitForPublicUrlNotOk(url, input.verifyTimeoutMs || 60000);
 	return {
 		ok: true,
@@ -1362,8 +1366,8 @@ async function getProjectStatus(projectIdOrName, options = {}) {
 		for (const route of routes) {
 			routeChecks.push({
 				path: route.path,
-				url: `${PUBLIC_HTTP_URL}${route.path}`,
-				check: await quickPublicUrlCheck(`${PUBLIC_HTTP_URL}${route.path}`),
+				url: publicUrlForPath(route.path),
+				check: await quickPublicUrlCheck(publicUrlForPath(route.path)),
 			});
 		}
 	}
@@ -1661,7 +1665,9 @@ async function checkPublicUrl(input = {}) {
 		throw new Error("Provide url or path.");
 	}
 	const publicPath = input.path ? normalizePath(input.path) : null;
-	const url = input.url || `${PUBLIC_HTTP_URL}${publicPath}`;
+	const url = input.url
+		? normalizePublicCheckUrl(input.url)
+		: publicUrlForPath(publicPath);
 	return {
 		ok: true,
 		url,
@@ -1898,6 +1904,7 @@ async function waitForPublicUrlNotOk(url, timeoutMs) {
 }
 
 async function dokploy(method, path, data) {
+	assertConfigured();
 	const url = new URL(`${DOKPLOY_URL}/api${path}`);
 	const init = {
 		method,
@@ -3096,21 +3103,70 @@ function assertConfigured() {
 	if (!API_KEY) {
 		throw new Error("DOKPLOY_API_KEY is required in the MCP server environment.");
 	}
+	validatePublicHttpUrl();
 }
 
 function platformRules() {
 	return [
 		"Use http://183.196.108.32:18080 as the public HTTP entry; do not assume 80/443.",
+		"DOKPLOY_PUBLIC_HTTP_URL must stay on http://183.196.108.32:18080; do not set it to localhost or a project port such as 8787.",
 		"Use a unique path prefix for each project.",
 		"When modifying an already deployed project, prefer deleting the old project and redeploying a fresh replacement with dokploy_replace_project_from_local_archive.",
 		"Do not patch normal user projects in place with compose.update, application.deploy, compose.deploy, or raw write tools unless doing administrator troubleshooting.",
 		"Member API keys do not write Traefik directly; traefikFiles.write=false is normal.",
 		"Publish routes through POST /join/routes.",
 		"/join/routes creates Host(183.196.108.32) && PathPrefix(/xxx) and defaults stripPrefix.",
-		"Compose targets use serviceName + internal port; application targets use applicationId + internal port.",
+		"Compose targets use serviceName + internal port; application targets use applicationId + internal port. The port argument is never the public browser port.",
 		"For Dokploy-native databases, use dokploy_create_postgres/mysql/mariadb/mongo/redis/libsql instead of enabling raw database tools.",
 		"Never point services at localhost.",
 	];
+}
+
+function validatePublicHttpUrl() {
+	const parsed = parseUrl(PUBLIC_HTTP_URL, "DOKPLOY_PUBLIC_HTTP_URL");
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw new Error("DOKPLOY_PUBLIC_HTTP_URL must be an HTTP URL.");
+	}
+	if (isLocalHost(parsed.hostname)) {
+		throw new Error("DOKPLOY_PUBLIC_HTTP_URL must be the public Dokploy entry, not localhost.");
+	}
+	if (parsed.hostname !== DEFAULT_PUBLIC_HOST || parsed.port !== "18080") {
+		throw new Error(`DOKPLOY_PUBLIC_HTTP_URL is ${PUBLIC_HTTP_URL}, but this host must publish through ${DEFAULT_PUBLIC_HTTP_URL}. Do not use a project/internal port such as 8787 as the public URL.`);
+	}
+}
+
+function publicUrlForPath(pathValue, options = {}) {
+	validatePublicHttpUrl();
+	const publicPath = normalizePath(pathValue);
+	const suffix = options.trailingSlash && !publicPath.endsWith("/") ? `${publicPath}/` : publicPath;
+	return `${PUBLIC_HTTP_URL}${suffix}`;
+}
+
+function normalizePublicCheckUrl(urlValue) {
+	const parsed = parseUrl(urlValue, "url");
+	if (isLocalHost(parsed.hostname)) {
+		throw new Error("Public URL checks must use the public Dokploy entry, not localhost.");
+	}
+	if (parsed.hostname === DEFAULT_PUBLIC_HOST && parsed.port && parsed.port !== "18080") {
+		throw new Error(`Public URL ${urlValue} uses port ${parsed.port}. Use ${DEFAULT_PUBLIC_HTTP_URL}<path>; project ports such as 8787 are internal only.`);
+	}
+	if (parsed.hostname === DEFAULT_PUBLIC_HOST && parsed.port === "18080") {
+		return parsed.toString();
+	}
+	return parsed.toString();
+}
+
+function parseUrl(value, label) {
+	try {
+		return new URL(String(value || ""));
+	} catch {
+		throw new Error(`${label} must be a valid URL.`);
+	}
+}
+
+function isLocalHost(hostname) {
+	const host = String(hostname || "").toLowerCase();
+	return host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".localhost");
 }
 
 function jsonToolResult(value) {
