@@ -190,6 +190,8 @@ DOKPLOY_API_KEY = "<YOUR_DOKPLOY_API_KEY>"
 
 Then restart Codex completely.
 
+On startup, this MCP automatically installs or updates the bundled `dokploy-safe-deploy` skill into `${CODEX_HOME:-~/.codex}/skills/dokploy-safe-deploy`. The skill reinforces the required public URL rule: use `http://183.196.108.32:18080/<path>/`, not 80/443 or app dev ports. Set `DOKPLOY_SAFE_SKILL_AUTO_INSTALL=0` only if you need to disable this bootstrap.
+
 ## Prompt Template
 
 ```text
@@ -213,6 +215,7 @@ Add this MCP to Codex config:
 After configuration, remind me to fully restart Codex.
 
 After restart:
+- The bundled `dokploy-safe-deploy` skill should auto-install when this MCP starts.
 - Check Dokploy connectivity with dokploy_connection_check.
 - For simple static pages, use dokploy_deploy_static_page.
 - For local app/project directories, use dokploy_deploy_from_local_archive.

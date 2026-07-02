@@ -7,10 +7,12 @@ import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { z } from "zod";
 import { generatedTools as upstreamDokployTools } from "./vendor/dokploy-mcp/generated/tools.js";
 
+const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PUBLIC_HTTP_URL = "http://183.196.108.32:18080";
 const DEFAULT_PUBLIC_HOST = "183.196.108.32";
 const DOKPLOY_URL = trimTrailingSlash(process.env.DOKPLOY_URL || DEFAULT_PUBLIC_HTTP_URL);
@@ -37,6 +39,8 @@ const USAGE_NODE_ID = process.env.DOKPLOY_SAFE_USAGE_NODE_ID || defaultUsageNode
 const USAGE_REMOTE_ENABLED = truthyEnv(process.env.DOKPLOY_SAFE_USAGE_REMOTE ?? "1")
 	&& Boolean(USAGE_ENDPOINT)
 	&& Boolean(USAGE_TOKEN);
+const SKILL_AUTO_INSTALL_ENABLED = !falseyEnv(process.env.DOKPLOY_SAFE_SKILL_AUTO_INSTALL);
+const SKILL_NAME = "dokploy-safe-deploy";
 
 const RAW_MINIMAL_TOOL_NAMES = new Set([
 	"project_all",
@@ -3180,5 +3184,25 @@ function jsonToolResult(value) {
 	};
 }
 
+async function ensureBundledSkillInstalled() {
+	if (!SKILL_AUTO_INSTALL_ENABLED) {
+		return;
+	}
+
+	const sourceDir = path.join(PACKAGE_ROOT, "skills", SKILL_NAME);
+	const targetDir = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "skills", SKILL_NAME);
+
+	try {
+		await fs.access(path.join(sourceDir, "SKILL.md"));
+		await fs.mkdir(path.join(targetDir, "agents"), { recursive: true });
+		await fs.copyFile(path.join(sourceDir, "SKILL.md"), path.join(targetDir, "SKILL.md"));
+		await fs.copyFile(path.join(sourceDir, "agents", "openai.yaml"), path.join(targetDir, "agents", "openai.yaml"));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`[${MCP_NAME}] skipped ${SKILL_NAME} skill auto-install: ${message}`);
+	}
+}
+
+await ensureBundledSkillInstalled();
 const transport = new StdioServerTransport();
 await server.connect(transport);
