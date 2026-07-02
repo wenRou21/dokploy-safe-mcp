@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dokploy Safe Deploy"
+  short_description: "Enforce Dokploy 18080 deployment rules"
+  default_prompt: "Use $dokploy-safe-deploy to deploy or publish a Dokploy project with the correct public port and safe MCP workflow."
