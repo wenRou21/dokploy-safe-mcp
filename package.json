@@ -1,17 +1,17 @@
 {
   "name": "dokploy-safe-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Safe Dokploy deployment wrapper MCP for path-based deployments",
   "main": "server.mjs",
   "bin": {
     "dokploy-safe-mcp": "./server.mjs"
   },
-	"scripts": {
-		"start": "node server.mjs",
-		"check": "node --check server.mjs",
-		"usage": "node scripts/summarize-usage.mjs",
-		"usage:collector": "node scripts/usage-collector.mjs"
-	},
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs",
+    "usage": "node scripts/summarize-usage.mjs",
+    "usage:collector": "node scripts/usage-collector.mjs"
+  },
   "keywords": [],
   "author": "",
   "license": "MIT",
